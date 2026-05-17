@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: betazoid-postgres
+    environment:
+      POSTGRES_USER: betazoidpostgres
+      POSTGRES_PASSWORD: betazoidpassword
+      POSTGRES_DB: betazoid
+    ports:
+      - '5434:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: betazoid-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@betazoid.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - '5050:80'
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
