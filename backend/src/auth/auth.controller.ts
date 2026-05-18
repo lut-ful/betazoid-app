@@ -1,6 +1,8 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import { Body, Controller, HttpCode, HttpStatus, Post, Req, Res } from '@nestjs/common';
+import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
+import { LoginDto } from './dto/login.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -10,5 +12,40 @@ export class AuthController {
     @HttpCode(HttpStatus.CREATED)
     register(@Body() dto: RegisterDto) {
         return this.authService.register(dto);
+    }
+
+    @Post('login')
+    @HttpCode(HttpStatus.OK)
+    async login(
+        @Body() dto: LoginDto,
+        @Res({ passthrough: true }) res: Response,
+    ) {
+        const { accessToken, refreshToken } = await this.authService.login(dto);
+        this.setRefreshCookie(res, refreshToken);
+        return { access_token: accessToken };
+    }
+
+    @Post('refresh')
+    @HttpCode(HttpStatus.OK)
+    async refresh(
+        @Req() req: Request,
+        @Res({ passthrough: true }) res: Response,
+    ) {
+        const token = req.cookies['refresh_token'];
+        if (!token) {
+            throw new Error('No refresh token');
+        }
+        const { accessToken, refreshToken } = await this.authService.refresh(token);
+        this.setRefreshCookie(res, refreshToken);
+        return { access_token: accessToken };
+    }
+
+    private setRefreshCookie(res: Response, token: string) {
+        res.cookie('refresh_token', token, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'lax',
+            maxAge: 7 * 24 * 60 * 60 * 1000,
+        });
     }
 }

@@ -34,4 +34,10 @@ export class User {
 
     @UpdateDateColumn()
     updated_at: Date;
+
+    @Column({ nullable: true })
+    refresh_token_hash:string;
+
+    @Column({type: 'timestamp', nullable: true})
+    refresh_token_expires_at: Date;
 }
