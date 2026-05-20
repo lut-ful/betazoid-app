@@ -1,5 +1,6 @@
 import { MailModule } from './mail/mail.module';
 import { AuthModule } from './auth/auth.module';
+import { PermissionsModule } from './permissions/permissions.module';
 import { RolesModule } from './roles/roles.module';
 import { UsersModule } from './users/users.module';
 import { Module } from '@nestjs/common';
@@ -25,6 +26,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
     }),
     AuthModule,
     MailModule,
+    PermissionsModule,
     RolesModule,
     UsersModule,
   ],

@@ -2,6 +2,7 @@
 
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -106,11 +107,18 @@ export default function RolesPage() {
                     {roles && roles.length > 0 && (
                         <ul className="space-y-2">
                             {roles.map((role) => (
-                                <li key={role.role_id} className="flex flex-col gap-0.5 border-b pb-2 last:border-0">
-                                    <span className="font-medium text-sm">{role.name}</span>
-                                    {role.description && (
-                                        <span className="text-xs text-muted-foreground">{role.description}</span>
-                                    )}
+                                <li key={role.role_id} className="flex items-center justify-between border-b pb-2 last:border-0">
+                                    <div className="flex flex-col gap-0.5">
+                                        <span className="font-medium text-sm">{role.name}</span>
+                                        {role.description && (
+                                            <span className="text-xs text-muted-foreground">{role.description}</span>
+                                        )}
+                                    </div>
+                                    <Button asChild variant="outline" size="sm">
+                                        <Link href={`/admin/roles/${role.role_id}/permissions`}>
+                                            Manage Permissions
+                                        </Link>
+                                    </Button>
                                 </li>
                             ))}
                         </ul>
