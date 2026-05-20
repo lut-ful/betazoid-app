@@ -48,6 +48,7 @@ You never store a user's password in plain text. If your database is ever breach
 A JWT is a compact, self-contained token that proves who you are.
 
 **Structure:** three Base64-encoded parts separated by dots:
+
 ```
 eyJhbGciOiJIUzI1NiJ9  .  eyJzdWIiOiJ1c2VyLTEyMyJ9  .  SflKxwRJSMeKKF2QT4fwpMeJf
       header                      payload                      signature
@@ -60,6 +61,7 @@ eyJhbGciOiJIUzI1NiJ9  .  eyJzdWIiOiJ1c2VyLTEyMyJ9  .  SflKxwRJSMeKKF2QT4fwpMeJf
 The server keeps the `JWT_SECRET`. Anyone with that secret can verify a token. Anyone without it cannot forge one.
 
 **Key properties:**
+
 - Stateless — the server does not store it anywhere
 - Self-expiring — the `exp` claim is a Unix timestamp; the server rejects expired tokens
 - Cannot be tampered with — changing any bit in the payload breaks the signature
@@ -70,11 +72,11 @@ The server keeps the `JWT_SECRET`. Anyone with that secret can verify a token. A
 
 A single token would work, but creates a security dilemma:
 
-| | Short-lived token | Long-lived token |
-|---|---|---|
-| If stolen | Attacker has 15 minutes | Attacker has 7 days |
-| After password change | Expires quickly | Still valid |
-| Database lookup needed | No (stateless) | Yes (to verify it) |
+|                        | Short-lived token       | Long-lived token    |
+| ---------------------- | ----------------------- | ------------------- |
+| If stolen              | Attacker has 15 minutes | Attacker has 7 days |
+| After password change  | Expires quickly         | Still valid         |
+| Database lookup needed | No (stateless)          | Yes (to verify it)  |
 
 The solution is **two tokens**:
 
@@ -90,6 +92,7 @@ When the access token expires, the frontend silently calls `/auth/refresh` with 
 ### 1.4 HTTP-only Cookies
 
 Cookies have a flag called `httpOnly`. When set:
+
 - The browser sends the cookie automatically with every request to your domain
 - JavaScript **cannot** read it (`document.cookie` does not show it)
 
@@ -132,6 +135,7 @@ Understanding this order explains why `ValidationPipe` rejects bad DTOs before y
 > *As a new user, I want to register with my full name, email, Gmail, and password so that I can create an account on Betazoid.*
 
 ### Acceptance Criteria
+
 - User can submit registration form with all required fields
 - System validates email uniqueness
 - Password is hashed before storing
@@ -249,12 +253,14 @@ frontend/src/app/register/page.tsx
 ```
 
 **Libraries used:**
+
 - `react-hook-form` — manages form state and validation
 - `zod` — schema validation (mirrors DTO rules on the client)
 - `@hookform/resolvers/zod` — connects zod schema to react-hook-form
 - `axios` — HTTP client
 
 **Flow:**
+
 ```
 User fills form
     ↓
@@ -275,6 +281,7 @@ On error   → display error from server (email taken, etc.)
 > *As a registered user, I want to log in with my email and password so that I can access my account.*
 
 ### Acceptance Criteria
+
 - System returns a JWT access token and refresh token on success
 - Invalid credentials return an appropriate error message
 - Refresh token rotates on each use
@@ -311,12 +318,12 @@ Body: { email, password }
 
 ### 3.2 Why SHA-256 for refresh tokens, bcrypt for passwords?
 
-| | Password | Refresh Token |
-|---|---|---|
-| Origin | Human-chosen, short, guessable | `crypto.randomUUID()` — 122 bits random |
-| Threat | Brute-force, dictionary, rainbow tables | Database breach |
-| Hash | bcrypt (slow, salted) | SHA-256 (fast, deterministic) |
-| Can query DB by hash? | No (salt makes it non-deterministic) | Yes |
+|                       | Password                                | Refresh Token                              |
+| --------------------- | --------------------------------------- | ------------------------------------------ |
+| Origin                | Human-chosen, short, guessable          | `crypto.randomUUID()` — 122 bits random |
+| Threat                | Brute-force, dictionary, rainbow tables | Database breach                            |
+| Hash                  | bcrypt (slow, salted)                   | SHA-256 (fast, deterministic)              |
+| Can query DB by hash? | No (salt makes it non-deterministic)    | Yes                                        |
 
 Because the refresh token is randomly generated with enormous entropy, even if an attacker gets the SHA-256 hash from the DB, they cannot find the original token — there are 2¹²² possibilities. Bcrypt's slowness is not needed here.
 
@@ -374,6 +381,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 **Why the `!` on `JWT_SECRET`?** TypeScript types every `process.env.*` as `string | undefined` — it can never know at compile time what your `.env` file contains. The `secretOrKey` option requires `string`, so passing `string | undefined` causes a type error. The `!` (non-null assertion) tells TypeScript: "I guarantee this is set at runtime." It has zero effect on the compiled JavaScript.
 
 When `JwtAuthGuard` is applied to a route:
+
 1. Passport extracts the token from `Authorization: Bearer <token>`
 2. Verifies the signature against `JWT_SECRET`
 3. Checks `exp` — rejects if expired
@@ -452,12 +460,12 @@ frontend/src/app/login/page.tsx
 
 **Where to store the access token on the frontend:**
 
-| Location | Readable by JS? | Safe from XSS? | Safe from CSRF? |
-|---|---|---|---|
-| `localStorage` | Yes | No | Yes |
-| Regular cookie | Yes | No | No |
-| HTTP-only cookie | No | Yes | No |
-| Memory (Zustand) | Yes | Yes | Yes |
+| Location         | Readable by JS? | Safe from XSS? | Safe from CSRF? |
+| ---------------- | --------------- | -------------- | --------------- |
+| `localStorage` | Yes             | No             | Yes             |
+| Regular cookie   | Yes             | No             | No              |
+| HTTP-only cookie | No              | Yes            | No              |
+| Memory (Zustand) | Yes             | Yes            | Yes             |
 
 Access token → **Zustand store (memory)**. It disappears on page refresh but gets silently renewed by the refresh token flow.
 Refresh token → **HTTP-only cookie** (set by the server, invisible to JS).
@@ -529,6 +537,7 @@ export default api;
 **Three things to understand:**
 
 **`withCredentials: true`** — Without this, the browser strips cookies from cross-origin requests (frontend on port 3001 → backend on port 3002). This flag tells the browser to include cookies. The backend must also have `credentials: true` in its CORS config:
+
 ```typescript
 // backend/src/main.ts
 app.enableCors({ origin: 'http://localhost:3001', credentials: true });
@@ -547,6 +556,7 @@ This interceptor catches every `401 Unauthorized` response, silently calls `/aut
 > *As a logged-in user, I want to log out so that my session is terminated securely.*
 
 ### Acceptance Criteria
+
 - Refresh token is invalidated on logout
 - User is redirected to the login page
 
@@ -560,10 +570,10 @@ With stateless JWTs it's different. The server does not store the access token a
 
 This creates a dilemma:
 
-| Token | Lives in | Can server invalidate? | Lifespan |
-|---|---|---|---|
-| Access token | JS memory (Zustand) | No — stateless | 15 minutes |
-| Refresh token | HTTP-only cookie + DB (as hash) | **Yes** — stored in DB | 7 days |
+| Token         | Lives in                        | Can server invalidate?        | Lifespan   |
+| ------------- | ------------------------------- | ----------------------------- | ---------- |
+| Access token  | JS memory (Zustand)             | No — stateless               | 15 minutes |
+| Refresh token | HTTP-only cookie + DB (as hash) | **Yes** — stored in DB | 7 days     |
 
 The standard solution: **kill the refresh token in the DB**. The access token will still work for up to 15 minutes after logout — that is an accepted trade-off of stateless JWT auth. But once it expires, the attacker cannot get a new one because the refresh token is gone.
 
@@ -640,6 +650,7 @@ async logout(userId: string): Promise<{ message: string }> {
 ```
 
 This is intentionally simple. TypeORM's `update()` runs:
+
 ```sql
 UPDATE users SET refresh_token_hash = NULL, refresh_token_expires_at = NULL
 WHERE user_id = $1
@@ -732,11 +743,11 @@ Without `finally`, a network error in scenario C would leave the user stuck — 
 
 **Two-sided cleanup:**
 
-| What gets cleaned | Where | Effect |
-|---|---|---|
-| `refresh_token_hash` | Database (via `POST /auth/logout`) | Cannot get new access tokens |
-| `refresh_token` cookie | Browser (via `res.clearCookie`) | Cookie no longer sent to server |
-| `accessToken` | Zustand store in JS memory | No Authorization header on requests |
+| What gets cleaned        | Where                                | Effect                              |
+| ------------------------ | ------------------------------------ | ----------------------------------- |
+| `refresh_token_hash`   | Database (via `POST /auth/logout`) | Cannot get new access tokens        |
+| `refresh_token` cookie | Browser (via `res.clearCookie`)    | Cookie no longer sent to server     |
+| `accessToken`          | Zustand store in JS memory           | No Authorization header on requests |
 
 ---
 
@@ -792,6 +803,7 @@ Browser                      NestJS Backend               PostgreSQL
 > *As a user who forgot their password, I want to receive a password reset email so that I can regain access to my account.*
 
 ### Acceptance Criteria
+
 - Reset link is sent to the registered email
 - Link expires after 30 minutes
 - Password is updated successfully after reset
@@ -1263,6 +1275,7 @@ Browser                  NestJS                       PostgreSQL      Mailtrap
 > *As a logged-in user, I want to view and update my profile so that my information stays current.*
 
 ### Acceptance Criteria
+
 - User can update name, bio, and profile photo
 - Gmail field is visible but not editable after registration
 - Changes are saved and reflected immediately
@@ -1273,10 +1286,10 @@ Browser                  NestJS                       PostgreSQL      Mailtrap
 
 Up to this point, every endpoint has lived in the `auth` module. US-05 introduces the `users` module — a deliberate separation that matters as the codebase grows.
 
-| Module | Owns | Reason |
-|---|---|---|
-| `auth` | Login, logout, register, token refresh, password reset | Concerns: identity proof and session lifecycle |
-| `users` | Profile view/edit, account settings | Concerns: user data management |
+| Module    | Owns                                                   | Reason                                         |
+| --------- | ------------------------------------------------------ | ---------------------------------------------- |
+| `auth`  | Login, logout, register, token refresh, password reset | Concerns: identity proof and session lifecycle |
+| `users` | Profile view/edit, account settings                    | Concerns: user data management                 |
 
 If both lived in `auth`, that module would balloon to own half the application. NestJS's module system is designed around single-responsibility domains — `auth` proves who you are, `users` manages what you have.
 
@@ -1315,14 +1328,15 @@ An alternative is `@Exclude()` decorators from `class-transformer` with `ClassSe
 
 HTTP defines two verbs for updates:
 
-| Verb | Semantics | Behavior |
-|---|---|---|
-| `PUT` | Replace the entire resource | All fields required. Missing fields are set to null/default |
+| Verb      | Semantics                     | Behavior                                                       |
+| --------- | ----------------------------- | -------------------------------------------------------------- |
+| `PUT`   | Replace the entire resource   | All fields required. Missing fields are set to null/default    |
 | `PATCH` | Partially update the resource | Only provided fields are changed. Missing fields are untouched |
 
 Profile editing always uses `PATCH`. The user may want to update only their bio — a `PUT` would require sending the full name and photo URL too, or they'd be nulled out.
 
 The service reflects this: each field is conditionally assigned only `if (dto.field !== undefined)`. This means:
+
 - `{ full_name: "Alice" }` → updates only the name
 - `{ bio: "" }` → clears the bio
 - `{}` → no-op (all checks fail, but the save still runs — harmless)
@@ -1466,6 +1480,7 @@ export class UsersController {
 Using `/users/me` is more secure than `/users/:userId`. With an ID-based route, users might try `/users/other-users-uuid` to read someone else's profile. With `/me`, the user's identity always comes from the JWT — there is no user-supplied ID to tamper with.
 
 **`@Patch` has no `@HttpCode`** for the GET but has `@HttpCode(HttpStatus.OK)` on the PATCH. NestJS defaults:
+
 - `@Get` → 200 OK
 - `@Post` → 201 Created
 - `@Patch` → 200 OK
@@ -1516,6 +1531,7 @@ frontend/src/app/profile/page.tsx
 ```
 
 The profile page has two jobs:
+
 1. **Load** the current profile on mount (`useQuery` → `GET /users/me`)
 2. **Save** changes on submit (`useMutation` → `PATCH /users/me`)
 
@@ -1597,9 +1613,9 @@ This `<Input disabled>` is rendered **outside** the `<form>` element. It is not 
 
 **Gmail immutability — two layers of enforcement:**
 
-| Layer | Mechanism | Blocks |
-|---|---|---|
-| Frontend | `<Input disabled>` outside the form | User cannot type in the field |
+| Layer       | Mechanism                                      | Blocks                                |
+| ----------- | ---------------------------------------------- | ------------------------------------- |
+| Frontend    | `<Input disabled>` outside the form          | User cannot type in the field         |
 | Backend DTO | `gmail` not declared in `UpdateProfileDto` | `whitelist: true` strips it if sent |
 
 Neither layer alone is sufficient. Frontend-only enforcement can be bypassed with curl. Backend-only enforcement works but gives no feedback in the UI. Both together provide defense in depth.
@@ -1726,17 +1742,17 @@ AppModule
 
 ## Packages Used in Sprint 1
 
-| Package | Purpose |
-|---|---|
-| `@nestjs/jwt` | `JwtService` — sign and verify JWTs |
-| `@nestjs/passport` | NestJS wrapper for Passport.js |
-| `passport` | Authentication middleware framework |
-| `passport-jwt` | Passport strategy for JWT validation |
-| `bcrypt` | Password hashing |
-| `cookie-parser` | Parse cookies from incoming requests |
-| `class-validator` | DTO validation decorators |
-| `class-transformer` | DTO deserialization |
-| `nodemailer` | Send emails (via Mailtrap in dev) |
+| Package               | Purpose                                |
+| --------------------- | -------------------------------------- |
+| `@nestjs/jwt`       | `JwtService` — sign and verify JWTs |
+| `@nestjs/passport`  | NestJS wrapper for Passport.js         |
+| `passport`          | Authentication middleware framework    |
+| `passport-jwt`      | Passport strategy for JWT validation   |
+| `bcrypt`            | Password hashing                       |
+| `cookie-parser`     | Parse cookies from incoming requests   |
+| `class-validator`   | DTO validation decorators              |
+| `class-transformer` | DTO deserialization                    |
+| `nodemailer`        | Send emails (via Mailtrap in dev)      |
 
 ---
 
