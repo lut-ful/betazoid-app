@@ -1,5 +1,6 @@
 import { MailModule } from './mail/mail.module';
 import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
@@ -22,7 +23,8 @@ import { TypeOrmModule } from '@nestjs/typeorm';
       }),
     }),
     AuthModule,
-    MailModule
+    MailModule,
+    UsersModule,
   ],
 })
 export class AppModule {}

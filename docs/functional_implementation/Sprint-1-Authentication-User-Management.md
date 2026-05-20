@@ -1269,35 +1269,96 @@ Browser                  NestJS                       PostgreSQL      Mailtrap
 
 ---
 
-### 6.1 What this touches
+### 6.1 Theory — Separation of concerns: `auth` vs `users`
 
-This user story lives in the `users` module, not `auth`. The `auth` module handles authentication; `users` handles profile data.
+Up to this point, every endpoint has lived in the `auth` module. US-05 introduces the `users` module — a deliberate separation that matters as the codebase grows.
 
-```
-GET  /api/v1/users/me        → returns authenticated user's profile
-PATCH /api/v1/users/me       → updates name, bio, profile_photo_url
-```
+| Module | Owns | Reason |
+|---|---|---|
+| `auth` | Login, logout, register, token refresh, password reset | Concerns: identity proof and session lifecycle |
+| `users` | Profile view/edit, account settings | Concerns: user data management |
 
-Both endpoints are protected with `@UseGuards(JwtAuthGuard)`.
+If both lived in `auth`, that module would balloon to own half the application. NestJS's module system is designed around single-responsibility domains — `auth` proves who you are, `users` manages what you have.
 
----
-
-### 6.2 Why Gmail is immutable
-
-Gmail controls YouTube playlist access. Every enrollment triggers a YouTube Data API call to grant the student's Gmail address access to the course playlist. If Gmail were editable, a student could change it to steal playlist access under a different account or break their own access unexpectedly.
-
-Implementation: simply exclude `gmail` from the `UpdateUserDto`. If the client sends `gmail`, `whitelist: true` in `ValidationPipe` strips it silently. The DB column has no special constraint — enforcement is by omission from the DTO.
+**The `users` module still depends on `auth` for protection.** Every `users` endpoint uses `@UseGuards(JwtAuthGuard)`, which is defined in the `auth` module. `UsersModule` does not import `AuthModule` — guards are globally resolvable because `JwtStrategy` is registered in `AuthModule` which is imported by `AppModule`.
 
 ---
 
-### 6.3 UpdateUserDto
+### 6.2 Theory — Never return sensitive fields from the database
+
+Fetching a user row from PostgreSQL returns every column — including `password_hash`, `refresh_token_hash`, `reset_password_token`, and `refresh_token_expires_at`. If you return the full `User` object from your controller, those fields land in the API response.
+
+The fix is explicit field exclusion before returning:
+
+```
+Fetch full User from DB
+        ↓
+Destructure: pull out all sensitive fields into named variables
+        ↓
+Spread the rest into a new object (the "profile")
+        ↓
+Return the profile — sensitive fields never leave the server
+```
+
+In TypeScript, this pattern is called a **destructuring rest**:
 
 ```typescript
-// backend/src/users/dto/update-user.dto.ts
-import { IsOptional, IsString, MaxLength, IsUrl } from 'class-validator';
+const { password_hash, refresh_token_hash, ...profile } = user;
+return profile; // does not contain password_hash or refresh_token_hash
+```
 
-export class UpdateUserDto {
-    @IsOptional()
+An alternative is `@Exclude()` decorators from `class-transformer` with `ClassSerializerInterceptor` — but destructuring is simpler, explicit, and doesn't depend on global interceptor configuration.
+
+---
+
+### 6.3 Theory — PUT vs PATCH
+
+HTTP defines two verbs for updates:
+
+| Verb | Semantics | Behavior |
+|---|---|---|
+| `PUT` | Replace the entire resource | All fields required. Missing fields are set to null/default |
+| `PATCH` | Partially update the resource | Only provided fields are changed. Missing fields are untouched |
+
+Profile editing always uses `PATCH`. The user may want to update only their bio — a `PUT` would require sending the full name and photo URL too, or they'd be nulled out.
+
+The service reflects this: each field is conditionally assigned only `if (dto.field !== undefined)`. This means:
+- `{ full_name: "Alice" }` → updates only the name
+- `{ bio: "" }` → clears the bio
+- `{}` → no-op (all checks fail, but the save still runs — harmless)
+
+---
+
+### 6.4 Backend — Entity additions
+
+Two new nullable columns are added to `user.entity.ts`. Both follow the three-part nullable pattern from the TypeORM conventions:
+
+```typescript
+// backend/src/users/entities/user.entity.ts
+
+@Column({ type: 'text', nullable: true })   // ① nullable: true in decorator
+bio!: string | null;                        // ② | null in TS type, ③ explicit type
+
+@Column({ type: 'varchar', nullable: true })
+profile_photo_url!: string | null;
+```
+
+**`text` vs `varchar` for `bio`:** `text` in PostgreSQL is an unbounded string — no length limit. `varchar` without a length is also unbounded in Postgres, but by convention `text` signals "potentially long content" while `varchar` signals "a short identifier or URL." Bio gets `text`; the photo URL gets `varchar`.
+
+**`!` on every entity property:** TypeScript's `strictPropertyInitialization` requires that every class property is assigned in the constructor. TypeORM entities are populated by the ORM, not a constructor — the `!` (definite assignment assertion) tells TypeScript: "I guarantee this will be set at runtime, trust me." It has zero effect on the compiled JavaScript.
+
+**Profile photo in Sprint 1:** S3/R2 file storage is not introduced until Sprint 3 (US-12). For now, `profile_photo_url` stores any URL string the user provides. File upload gets wired in Sprint 3 when the infrastructure is introduced — this column will be reused unchanged.
+
+---
+
+### 6.5 Backend — DTO
+
+```typescript
+// backend/src/users/dto/update-profile.dto.ts
+import { IsOptional, IsString, IsUrl, MaxLength } from 'class-validator';
+
+export class UpdateProfileDto {
+    @IsOptional()     // field may be absent from the request body entirely
     @IsString()
     @MaxLength(100)
     full_name?: string;
@@ -1308,51 +1369,297 @@ export class UpdateUserDto {
     bio?: string;
 
     @IsOptional()
-    @IsUrl()
+    @IsUrl()          // rejects strings that are not valid URLs
     profile_photo_url?: string;
 }
 ```
 
-All fields are `@IsOptional()` — a `PATCH` request updates only what's provided.
+Every field is `@IsOptional()` — this is the PATCH pattern. Unlike `RegisterDto` where all fields are required, the `UpdateProfileDto` allows any combination of fields. `class-validator` skips validation decorators entirely when a field is absent.
+
+Notice what is **not** in this DTO: `gmail`, `email`, `password_hash`, `is_email_verified`. `ValidationPipe` with `whitelist: true` strips any field the client sends that is not declared here. Gmail immutability is enforced by omission — no special guard or check needed.
 
 ---
 
-### 6.4 Entity additions
-
-Add these columns to the User entity:
+### 6.6 Backend — Service
 
 ```typescript
-@Column({ nullable: true, length: 500 })
-bio: string;
+// backend/src/users/users.service.ts
+@Injectable()
+export class UsersService {
+    constructor(
+        @InjectRepository(User)
+        private usersRepository: Repository<User>,
+    ) {}
 
-@Column({ nullable: true })
-profile_photo_url: string;
+    async getProfile(userId: string) {
+        const user = await this.usersRepository.findOne({ where: { user_id: userId } });
+        if (!user) throw new NotFoundException('User not found');
+
+        const {
+            password_hash,
+            refresh_token_hash,
+            refresh_token_expires_at,
+            reset_password_token,
+            reset_password_expires_at,
+            email_verification_token,
+            ...profile
+        } = user;
+
+        return profile;
+    }
+
+    async updateProfile(userId: string, dto: UpdateProfileDto) {
+        const user = await this.usersRepository.findOne({ where: { user_id: userId } });
+        if (!user) throw new NotFoundException('User not found');
+
+        if (dto.full_name !== undefined) user.full_name = dto.full_name;
+        if (dto.bio !== undefined) user.bio = dto.bio;
+        if (dto.profile_photo_url !== undefined) user.profile_photo_url = dto.profile_photo_url;
+
+        await this.usersRepository.save(user);
+        return this.getProfile(userId);   // re-fetch to return the clean profile shape
+    }
+}
 ```
 
-Profile photo upload (to S3/R2) is not needed until Sprint 3. For now, the URL is just stored as a string — a user could paste an external image URL.
+**`getProfile` — destructuring rest:**
+The six sensitive fields are named explicitly in the destructure. TypeScript carries the exact type of `profile` forward: it knows `profile` does not contain `password_hash` etc. because those were pulled out. The `...profile` spread captures all remaining fields.
+
+**`updateProfile` — conditional assignment:**
+`!== undefined` is the correct check, not `if (dto.bio)`. The latter would skip falsy values like `""` (empty string), preventing a user from clearing their bio. `!== undefined` allows empty strings while still skipping truly absent fields.
+
+**`usersRepository.save()` vs `update()`:**
+`save()` runs a full `SELECT` then `UPDATE` (or `INSERT` if the entity is new). `update()` runs a bare `UPDATE WHERE` without a prior select. Here `save()` is used because we already have the entity object in memory — it's equivalent to `update()` in effect. The returned value from `save()` is not used; instead `getProfile()` is called afterward to ensure the response always goes through the same field-stripping logic.
 
 ---
 
-### 6.5 Frontend — Profile Page
+### 6.7 Backend — Controller
+
+```typescript
+// backend/src/users/users.controller.ts
+@Controller('users')
+export class UsersController {
+    constructor(private usersService: UsersService) {}
+
+    @Get('me')
+    @UseGuards(JwtAuthGuard)
+    getProfile(@Req() req: Request & { user: { userId: string } }) {
+        return this.usersService.getProfile(req.user.userId);
+    }
+
+    @Patch('me')
+    @HttpCode(HttpStatus.OK)
+    @UseGuards(JwtAuthGuard)
+    updateProfile(
+        @Req() req: Request & { user: { userId: string } },
+        @Body() dto: UpdateProfileDto,
+    ) {
+        return this.usersService.updateProfile(req.user.userId, dto);
+    }
+}
+```
+
+**`req.user.userId` not `req.user.sub`:**
+`JwtStrategy.validate()` returns `{ userId: payload.sub, email: payload.email }` — this is what NestJS attaches to `req.user`. The property is named `userId`, not `sub`. (The existing `auth.controller.ts` logout handler uses `req.user.sub` — this is a pre-existing inconsistency, not a pattern to follow.)
+
+**`@Get('me')` not `@Get(':id')`:**
+Using `/users/me` is more secure than `/users/:userId`. With an ID-based route, users might try `/users/other-users-uuid` to read someone else's profile. With `/me`, the user's identity always comes from the JWT — there is no user-supplied ID to tamper with.
+
+**`@Patch` has no `@HttpCode`** for the GET but has `@HttpCode(HttpStatus.OK)` on the PATCH. NestJS defaults:
+- `@Get` → 200 OK
+- `@Post` → 201 Created
+- `@Patch` → 200 OK
+
+The `@HttpCode(HttpStatus.OK)` on PATCH is redundant but explicit — it's there for clarity.
+
+---
+
+### 6.8 Backend — Module
+
+```typescript
+// backend/src/users/users.module.ts
+@Module({
+    imports: [TypeOrmModule.forFeature([User])],
+    controllers: [UsersController],
+    providers: [UsersService],
+    exports: [UsersService],    // ← exported so other modules can inject UsersService later
+})
+export class UsersModule {}
+```
+
+**`exports: [UsersService]`** — not needed by anything yet, but `UsersService` will be needed in future modules. For example, the `enrollments` module (Sprint 7) will need to look up a user's Gmail to trigger the YouTube grant job. Exporting now avoids having to come back and modify this file later.
+
+`UsersModule` is registered in `AppModule` like every other domain module:
+
+```typescript
+// backend/src/app.module.ts
+import { UsersModule } from './users/users.module';
+
+@Module({
+    imports: [
+        ConfigModule.forRoot({ isGlobal: true }),
+        TypeOrmModule.forRootAsync({ ... }),
+        AuthModule,
+        MailModule,
+        UsersModule,   // ← added
+    ],
+})
+export class AppModule {}
+```
+
+---
+
+### 6.9 Frontend — Profile Page
 
 ```
 frontend/src/app/profile/page.tsx
 ```
 
-**Flow:**
-```
-Page loads
-    ↓
-GET /api/v1/users/me → populate form with current values
-    ↓
-User edits name / bio
-    ↓
-PATCH /api/v1/users/me → save changes
-    ↓
-Show success toast, update displayed values
+The profile page has two jobs:
+1. **Load** the current profile on mount (`useQuery` → `GET /users/me`)
+2. **Save** changes on submit (`useMutation` → `PATCH /users/me`)
+
+It also needs to **pre-populate** the form with the loaded data — this requires `reset()` from react-hook-form, called inside a `useEffect` that runs when the query data arrives.
+
+```typescript
+'use client';
+
+// ① Redirect to login if not authenticated
+const accessToken = useAuthStore((s) => s.accessToken);
+useEffect(() => {
+    if (!accessToken) router.push('/login');
+}, [accessToken, router]);
+
+// ② Fetch the current profile
+const { data: profile, isLoading, isError } = useQuery<UserProfile>({
+    queryKey: ['profile'],
+    queryFn: async () => {
+        const { data } = await api.get('/users/me');
+        return data;
+    },
+    enabled: !!accessToken,   // don't fire until we know there's a token
+});
+
+// ③ Pre-populate the form when data arrives
+const { register, handleSubmit, reset, formState: { errors } } = useForm<ProfileFormData>({
+    resolver: zodResolver(profileSchema),
+});
+
+useEffect(() => {
+    if (profile) {
+        reset({
+            full_name: profile.full_name,
+            bio: profile.bio ?? '',              // null → empty string for the input
+            profile_photo_url: profile.profile_photo_url ?? '',
+        });
+    }
+}, [profile, reset]);
+
+// ④ Submit handler
+const mutation = useMutation({
+    mutationFn: (data: ProfileFormData) => {
+        const payload: Partial<ProfileFormData> = { full_name: data.full_name };
+        if (data.bio !== undefined) payload.bio = data.bio;
+        if (data.profile_photo_url) payload.profile_photo_url = data.profile_photo_url;
+        return api.patch('/users/me', payload);
+    },
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['profile'] });   // re-fetch profile
+    },
+});
 ```
 
-The Gmail field is rendered as a read-only `<input disabled>` or a plain `<p>` element — never inside the form's submit data.
+**Three things to understand:**
+
+**`enabled: !!accessToken`** — `useQuery` runs immediately on mount by default. But on this page the user might not be logged in yet (the `useEffect` redirect is async). `enabled: false` prevents the query from firing until `accessToken` is truthy. Without it, `GET /users/me` would fire unauthenticated, get a 401, trigger the silent refresh, and if that fails, redirect to login — a confusing sequence. `enabled` short-circuits all of that.
+
+**`reset()` in a `useEffect`** — react-hook-form registers default values at `useForm()` call time. But the profile data arrives asynchronously after the initial render. Calling `reset({ ...profile })` inside a `useEffect` that depends on `profile` replaces the form values with the server data once it arrives. The `[profile, reset]` dependency array ensures this runs exactly once when the data first loads (and again if the data ever changes, e.g., after a successful mutation).
+
+**`queryClient.invalidateQueries({ queryKey: ['profile'] })`** — After a successful PATCH, TanStack Query marks the `['profile']` cache entry as stale and re-fetches it. This is what makes the acceptance criterion "reflected immediately" work: the form re-populates with the server's confirmed data, not just the locally-typed values.
+
+**Gmail read-only display:**
+
+```tsx
+<div className="mb-4">
+    <Label>Gmail (read-only)</Label>
+    <Input value={profile?.gmail ?? ''} disabled />
+    <p className="text-sm text-muted-foreground mt-1">
+        Gmail cannot be changed — it controls your YouTube course access.
+    </p>
+</div>
+```
+
+This `<Input disabled>` is rendered **outside** the `<form>` element. It is not registered with react-hook-form and does not appear in the form's submit data. Even if it were inside the form and somehow submitted, `whitelist: true` on the backend would strip it.
+
+---
+
+### 6.10 Security & Design Notes
+
+**Gmail immutability — two layers of enforcement:**
+
+| Layer | Mechanism | Blocks |
+|---|---|---|
+| Frontend | `<Input disabled>` outside the form | User cannot type in the field |
+| Backend DTO | `gmail` not declared in `UpdateProfileDto` | `whitelist: true` strips it if sent |
+
+Neither layer alone is sufficient. Frontend-only enforcement can be bypassed with curl. Backend-only enforcement works but gives no feedback in the UI. Both together provide defense in depth.
+
+**No profile photo upload yet:** `profile_photo_url` accepts any URL string. A user could enter `https://i.imgur.com/...` or any external image URL. Real file upload (drag-and-drop → S3/R2) is introduced in Sprint 3. The DB column (`varchar`, nullable) requires no change when that feature arrives.
+
+**Stripping sensitive fields:** The six stripped fields (`password_hash`, `refresh_token_hash`, `refresh_token_expires_at`, `reset_password_token`, `reset_password_expires_at`, `email_verification_token`) should never appear in any API response. The destructuring approach in `getProfile()` is explicit — you can see exactly what is excluded. An accidental new sensitive column would be visible in responses until manually added to the destructure list. A more scalable alternative for larger projects is `@Exclude()` + `ClassSerializerInterceptor`, but explicit destructuring is clearer for a learning codebase.
+
+---
+
+### 6.11 The full flow
+
+```
+Browser                        NestJS                       PostgreSQL
+   |                               |                             |
+   | GET /api/v1/users/me          |                             |
+   | Authorization: Bearer <JWT>   |                             |
+   |-----------------------------> |                             |
+   |                          JwtAuthGuard                       |
+   |                          verifies JWT → attaches req.user   |
+   |                               |                             |
+   |                          UsersService.getProfile(userId)    |
+   |                               |--- SELECT * FROM users ---> |
+   |                               |    WHERE user_id = $1       |
+   |                               | <-------------------------- |
+   |                          destructure: strip sensitive fields |
+   |                               |                             |
+   | 200 { user_id, full_name,     |                             |
+   |   email, gmail, bio,          |                             |
+   |   profile_photo_url, ... }    |                             |
+   | <---------------------------- |                             |
+   |                               |                             |
+   | [User edits bio, clicks Save] |                             |
+   |                               |                             |
+   | PATCH /api/v1/users/me        |                             |
+   | Authorization: Bearer <JWT>   |                             |
+   | { full_name, bio }            |                             |
+   |-----------------------------> |                             |
+   |                          JwtAuthGuard                       |
+   |                          ValidationPipe (UpdateProfileDto)  |
+   |                          whitelist strips any unknown fields |
+   |                               |                             |
+   |                          UsersService.updateProfile()       |
+   |                               |--- SELECT users ----------> |
+   |                               | <-------------------------- |
+   |                          conditionally assign changed fields |
+   |                               |--- UPDATE users ----------> |
+   |                               |    SET full_name, bio       |
+   |                               |    WHERE user_id = $1       |
+   |                               | <-------------------------- |
+   |                          getProfile() → strip sensitive     |
+   |                               |                             |
+   | 200 { updated profile }       |                             |
+   | <---------------------------- |                             |
+   |                               |                             |
+   | TanStack Query invalidates    |                             |
+   | ['profile'] cache → re-fetch  |                             |
+   | Form pre-populates with       |                             |
+   | confirmed server values       |                             |
+```
 
 ---
 
