@@ -54,6 +54,12 @@ export class CoursesController {
         return this.coursesService.findOneForReview(id);
     }
 
+    @Public()
+    @Get(':id/public')
+    findPublicDetail(@Param('id') id: string) {
+        return this.coursesService.findPublicDetail(id);
+    }
+
     @Get(':id')
     findOne(@Param('id') id: string, @Request() req: any) {
         return this.coursesService.findOne(id, req.user.userId);

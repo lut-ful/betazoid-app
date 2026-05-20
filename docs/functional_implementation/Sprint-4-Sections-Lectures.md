@@ -11,6 +11,7 @@
 
 1. [US-16 — Section Management](#1-us-16--section-management)
 2. [US-17 — Create Lecture](#2-us-17--create-lecture)
+3. [US-18 — Free Preview Toggle](#3-us-18--free-preview-toggle)
 
 ---
 
@@ -784,4 +785,462 @@ Browser                  NestJS (LecturesController)          PostgreSQL
   |                                 |-- SELECT ORDER BY order ------>|
   |                                 |<-- [b, a, c] -----------------|
   |<-- 200 [ { lecture_id, title, content_type, order }, … ] -----|
+```
+
+---
+
+## 3. US-18 — Free Preview Toggle
+
+> *As an Instructor, I want to mark a lecture as free preview so that prospective students can sample the course before purchasing.*
+
+### Acceptance Criteria
+- Free preview toggle is available per lecture
+- Free preview lectures are accessible to non-enrolled users on the course page
+
+---
+
+### 3.1 Theory — Free Preview as a Marketing Tool
+
+On a paid learning platform, prospective students face a trust problem: they cannot evaluate a course without paying for it. Free preview lectures solve this by letting instructors unlock a subset of lectures for anyone to view before purchasing.
+
+The decision of *which* lectures to unlock sits entirely with the instructor. A course might have 30 lectures and the instructor might mark 3 as free preview — typically the first lecture of each section, or a particularly engaging demo. Marking a lecture as free preview does not change its position, content type, or order; it only controls access.
+
+**How access is modelled**
+
+A single boolean column `is_free_preview` on the `lectures` table is sufficient:
+
+```
+lectures
+┌─────────────┬───────────────────────┬──────────────────┬───────┐
+│ lecture_id  │         title         │  is_free_preview │ order │
+├─────────────┼───────────────────────┼──────────────────┼───────┤
+│ uuid-A      │ Welcome to the Course │       true       │   0   │
+│ uuid-B      │ Setting Up            │       false      │   1   │
+│ uuid-C      │ Core Concepts Intro   │       true       │   2   │
+│ uuid-D      │ Deep Dive             │       false      │   3   │
+└─────────────┴───────────────────────┴──────────────────┴───────┘
+```
+
+When a non-enrolled visitor loads the public course page, the backend returns all lectures with their `is_free_preview` flag. The frontend uses that flag to render each lecture as either viewable or locked. The enforcement of *actual video access* (YouTube playlist grant) is a Sprint 5 concern — at this stage, "accessible" means the frontend receives and displays the flag correctly.
+
+**Toggle vs. dedicated endpoint**
+
+Rather than a dedicated `PATCH /lectures/:id/preview` endpoint, the implementation re-uses the existing `PATCH /lectures/:id` update endpoint and adds `is_free_preview` as an optional PATCH field. This is the minimal approach — one fewer route, one fewer service method — while still meeting the acceptance criterion of a per-lecture toggle.
+
+---
+
+### 3.2 Theory — Exposing Public Data Without Breaking Auth
+
+The existing `GET /courses/:id` endpoint is protected by `JwtAuthGuard`. A non-enrolled visitor has no JWT, so they cannot call it. But the public course detail (sections, lectures, is_free_preview) must be available to anyone.
+
+The solution is a separate public endpoint `GET /courses/:id/public`. NestJS's `@Public()` decorator (established in Sprint 2) tells the JWT guard to skip authentication for that specific route. The guard checks for the decorator before validating the token:
+
+```
+Request arrives at GET /courses/:id/public
+         ↓
+JwtAuthGuard.canActivate()
+         ↓
+  Does the handler have @Public()? ──YES──→ allow through (no JWT needed)
+         ↓ NO
+  Is there a valid Bearer token?  ──NO───→ 401 Unauthorized
+         ↓ YES
+  Decode and attach user; allow through
+```
+
+`@Public()` is a metadata flag — `Reflector.getAllAndOverride(IS_PUBLIC_KEY, [...])` — that the guard reads. No extra infrastructure; just a decorator and a reflector check that was already in place.
+
+**Route ordering matters:** `GET :id/public` must appear in the controller *before* `GET :id`. NestJS matches routes top-to-bottom; if `:id` came first, the literal string `"public"` would be captured as the course ID, and the wrong handler — the protected one — would fire.
+
+---
+
+### 3.3 Backend — Entity and DTO
+
+#### Entity change — `lecture.entity.ts`
+
+A single column addition:
+
+```typescript
+@Column({ type: 'boolean', default: false })
+is_free_preview!: boolean;
+```
+
+- `type: 'boolean'` — maps to `BOOLEAN` in PostgreSQL.
+- `default: false` — every newly created lecture starts as non-preview. The instructor opts in explicitly, never accidentally exposing a lecture.
+- No `nullable: true` needed — the column is always present and always has a value.
+
+#### DTO change — `update-lecture.dto.ts`
+
+`is_free_preview` is added as an optional PATCH field:
+
+```typescript
+export class UpdateLectureDto {
+    @IsOptional() @IsString() @MinLength(1) @MaxLength(200)
+    title?: string;
+
+    @IsOptional() @IsEnum(Object.values(LectureContentType))
+    content_type?: LectureContentType;
+
+    @IsOptional()
+    @IsBoolean()        // ← validates that the value is exactly true or false, not "true" (string)
+    is_free_preview?: boolean;
+}
+```
+
+`@IsBoolean()` from `class-validator` rejects truthy strings like `"true"` or `1`. The global `ValidationPipe` with `transform: true` would coerce strings to booleans, but by requiring strict booleans in the body the API remains honest about its contract.
+
+#### Service change — `lectures.service.ts`
+
+One line added to the `update()` method, alongside the existing field checks:
+
+```typescript
+async update(courseId, sectionId, lectureId, dto, instructorId): Promise<Lecture> {
+    await this.verifySectionOwnership(courseId, sectionId, instructorId);
+
+    const lecture = await this.lectureRepo.findOne({
+        where: { lecture_id: lectureId, section: { section_id: sectionId } },
+    });
+    if (!lecture) throw new NotFoundException('Lecture not found');
+
+    if (dto.title !== undefined) lecture.title = dto.title;
+    if (dto.content_type !== undefined) lecture.content_type = dto.content_type;
+    if (dto.is_free_preview !== undefined) lecture.is_free_preview = dto.is_free_preview;  // ← new
+
+    return this.lectureRepo.save(lecture);
+}
+```
+
+The `!== undefined` guard is the standard PATCH pattern: only update a field if the caller explicitly sent it. This lets a client toggle `is_free_preview` without needing to resend `title` or `content_type`.
+
+---
+
+### 3.4 Backend — Public Course Detail Endpoint
+
+#### New interface types — `courses.service.ts`
+
+Three plain interfaces describe the public response shape:
+
+```typescript
+export interface PublicLecture {
+    lecture_id: string;
+    title: string;
+    content_type: string;
+    order: number;
+    is_free_preview: boolean;   // ← the flag non-enrolled users need
+}
+
+export interface PublicSection {
+    section_id: string;
+    title: string;
+    order: number;
+    lectures: PublicLecture[];
+}
+
+export interface PublicCourseDetail {
+    course_id: string;
+    title: string;
+    description: string;
+    price: number;
+    thumbnail_url: string | null;
+    language: string;
+    level: string;
+    rating: number;
+    instructor_name: string;    // ← denormalized: no need to expose the full User object
+    category_name: string | null;
+    sections: PublicSection[];
+}
+```
+
+Only safe, public fields are exposed. The instructor's email, user_id, and other course metadata (rejection_reason, status) are intentionally omitted from the response.
+
+#### New repos injected — `CoursesService` constructor
+
+`findPublicDetail` needs to query the `sections` and `lectures` tables. Two new repos are injected:
+
+```typescript
+constructor(
+    @InjectRepository(Course)    private readonly courseRepo: Repository<Course>,
+    @InjectRepository(Category)  private readonly categoryRepo: Repository<Category>,
+    @InjectRepository(Section)   private readonly sectionRepo: Repository<Section>,   // ← new
+    @InjectRepository(Lecture)   private readonly lectureRepo: Repository<Lecture>,   // ← new
+    private readonly mailService: MailService,
+    private readonly config: ConfigService,
+) {}
+```
+
+And `CoursesModule` registers the two entity repositories:
+
+```typescript
+imports: [TypeOrmModule.forFeature([Course, Category, Section, Lecture]), MailModule],
+```
+
+Why register `Section` and `Lecture` in `CoursesModule` instead of importing `SectionsModule` or `LecturesModule`? Module imports expose *services*, not repositories. To inject a repository directly, you must register its entity with `forFeature` in the consuming module. Importing `LecturesModule` would give access to `LecturesService`, but `CoursesService` needs raw repository access to assemble its own bespoke response shape.
+
+#### `findPublicDetail` service method
+
+```typescript
+async findPublicDetail(courseId: string): Promise<PublicCourseDetail> {
+    // 1. Load the course — only if it is published
+    const course = await this.courseRepo.findOne({
+        where: { course_id: courseId, status: CourseStatus.PUBLISHED },
+        relations: ['instructor', 'category'],
+    });
+    if (!course) throw new NotFoundException('Course not found');
+    // Note: a DRAFT or PENDING course returns 404 — same message as non-existent.
+    // This prevents enumeration of unpublished course IDs.
+
+    // 2. Load sections ordered by position
+    const sections = await this.sectionRepo.find({
+        where: { course: { course_id: courseId } },
+        order: { order: 'ASC' },
+    });
+
+    // 3. For each section, load its lectures (N+1 pattern — acceptable for a detail page)
+    const sectionsWithLectures: PublicSection[] = await Promise.all(
+        sections.map(async (section) => {
+            const lectures = await this.lectureRepo.find({
+                where: { section: { section_id: section.section_id } },
+                order: { order: 'ASC' },
+            });
+            return {
+                section_id: section.section_id,
+                title: section.title,
+                order: section.order,
+                lectures: lectures.map((l) => ({
+                    lecture_id: l.lecture_id,
+                    title: l.title,
+                    content_type: l.content_type,
+                    order: l.order,
+                    is_free_preview: l.is_free_preview,
+                })),
+            };
+        }),
+    );
+
+    // 4. Assemble the response, parsing decimal strings from PostgreSQL
+    return {
+        course_id: course.course_id,
+        title: course.title,
+        description: course.description,
+        price: parseFloat(course.price as unknown as string),    // TypeORM returns DECIMAL as string
+        thumbnail_url: course.thumbnail_url,
+        language: course.language,
+        level: course.level,
+        rating: parseFloat(course.rating as unknown as string),  // same
+        instructor_name: course.instructor.full_name,
+        category_name: course.category?.name ?? null,
+        sections: sectionsWithLectures,
+    };
+}
+```
+
+**The N+1 query pattern:** The code runs one `lectureRepo.find` per section. For a course with 8 sections this is 1 (course) + 1 (sections) + 8 (lectures per section) = 10 queries. For a public detail page that is called once per page load, this is completely acceptable. A single `JOIN` query builder would be more efficient but harder to read and map. The pragmatic choice here is legibility over micro-optimization.
+
+**`parseFloat` on decimal columns:** TypeORM returns PostgreSQL `DECIMAL` / `NUMERIC` columns as strings to preserve precision (JavaScript `number` is a 64-bit float and cannot represent all decimal values exactly). Always wrap with `parseFloat()` before returning to clients.
+
+#### Controller — `courses.controller.ts`
+
+```typescript
+@Public()               // ← no JWT required
+@Get(':id/public')      // ← must come BEFORE @Get(':id')
+findPublicDetail(@Param('id') id: string) {
+    return this.coursesService.findPublicDetail(id);
+}
+```
+
+No `@Request()` needed — the endpoint is stateless and unauthenticated. `@Public()` is enough to bypass the guard.
+
+---
+
+### 3.5 Frontend — Lecture Management Page (Toggle)
+
+**File:** `frontend/src/app/courses/[id]/sections/[sectionId]/lectures/page.tsx`
+
+#### Updated `Lecture` interface
+
+```typescript
+interface Lecture {
+    lecture_id: string;
+    title: string;
+    content_type: ContentType;
+    order: number;
+    is_free_preview: boolean;   // ← added
+}
+```
+
+#### Toggle mutation
+
+```typescript
+const togglePreviewMutation = useMutation({
+    mutationFn: ({ lectureId, is_free_preview }: { lectureId: string; is_free_preview: boolean }) =>
+        api.patch(
+            `/courses/${courseId}/sections/${sectionId}/lectures/${lectureId}`,
+            { is_free_preview }
+        ),
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
+    },
+});
+```
+
+The mutation sends `PATCH /lectures/:id` with only `{ is_free_preview: <new value> }`. The backend's `update()` method applies only that field and leaves title and content_type unchanged.
+
+#### Preview badge in lecture title
+
+When a lecture is already marked as free preview, a badge appears next to its title in the list:
+
+```tsx
+{lecture.is_free_preview && (
+    <span className="ml-2 text-xs border border-border px-1 rounded">
+        Free Preview
+    </span>
+)}
+```
+
+This uses only design-token classes (`border-border`) — no raw Tailwind color values — consistent with the frontend conventions.
+
+#### Toggle button
+
+The button label switches between `"Set Preview"` and `"Remove Preview"` based on the current state:
+
+```tsx
+<Button
+    size="sm"
+    variant="outline"
+    disabled={togglePreviewMutation.isPending}
+    onClick={() =>
+        togglePreviewMutation.mutate({
+            lectureId: lecture.lecture_id,
+            is_free_preview: !lecture.is_free_preview,   // ← flip the boolean
+        })
+    }
+>
+    {lecture.is_free_preview ? 'Remove Preview' : 'Set Preview'}
+</Button>
+```
+
+`disabled={togglePreviewMutation.isPending}` prevents double-clicks during the network round-trip. On success, the query is invalidated and the list refetches, updating the badge and button label.
+
+---
+
+### 3.6 Frontend — Public Course Detail Page
+
+**File:** `frontend/src/app/courses/[id]/page.tsx`
+
+This page is reachable by anyone — no login required. It uses TanStack Query without the `enabled: !!accessToken` guard (the endpoint needs no token).
+
+```typescript
+const { data: course, isLoading, isError } = useQuery<PublicCourseDetail>({
+    queryKey: ['course-public', courseId],
+    queryFn: async () => {
+        const { data } = await api.get(`/courses/${courseId}/public`);
+        return data;
+    },
+    enabled: !!courseId,   // ← only needs the course ID, not a token
+});
+```
+
+The shared `api` instance from `lib/axios.ts` is used — it attaches a Bearer token if one is in the Zustand store, but does not fail if there is none. `withCredentials: true` is still set for the cookie refresh flow, but this endpoint ignores credentials entirely.
+
+#### Section and lecture rendering
+
+```tsx
+{course.sections.map((section) => (
+    <div key={section.section_id} className="space-y-2">
+        <p className="text-sm font-medium">{section.title}</p>
+        <div className="space-y-1 ml-4">
+            {section.lectures.map((lecture) => (
+                <div key={lecture.lecture_id} className="flex items-center gap-2 text-sm">
+                    <span>
+                        {lecture.title}{' '}
+                        <span className="text-muted-foreground">[{lecture.content_type}]</span>
+                    </span>
+                    {lecture.is_free_preview ? (
+                        <span className="text-xs border border-border px-1 rounded">
+                            Free Preview
+                        </span>
+                    ) : (
+                        <span className="text-xs text-muted-foreground">Enrolled only</span>
+                    )}
+                </div>
+            ))}
+        </div>
+        <Separator />
+    </div>
+))}
+```
+
+Every lecture is visible in the list — title, content type, and access status. Non-preview lectures show "Enrolled only" so prospective students understand the structure without being able to access the content. This mirrors how Udemy's course preview page works.
+
+---
+
+### 3.7 Security / Design Notes
+
+**Draft and pending courses return 404.** `findPublicDetail` filters by `status: CourseStatus.PUBLISHED`. A course that is DRAFT or PENDING returns the same `NotFoundException` as a non-existent course. This prevents course ID enumeration — an attacker scanning UUIDs cannot distinguish "doesn't exist" from "exists but not yet published".
+
+**`@Public()` does not bypass `RbacGuard`.** This endpoint has no `@RequirePermission()` decorator, so `RbacGuard` never runs on it either. Only the JWT guard is bypassed.
+
+**Content type is for structure, not access control.** At Sprint 4, "accessible" means the lecture appears on the public course page with a Free Preview badge. Actual video delivery (YouTube playlist grant) is enforced in Sprint 5. The `is_free_preview` flag drives that future grant decision — if a lecture is `is_free_preview: true`, Sprint 5's logic will embed the player without requiring enrollment.
+
+**Instructor cannot preview-toggle while course is PENDING.** The `update()` service method goes through `verifySectionOwnership`, which blocks all mutations — including `is_free_preview` changes — when the course status is `PENDING`. This is the same lockout applied to all lecture mutations (US-13 rule).
+
+---
+
+### 3.8 The Full Flow
+
+**Toggle a lecture to free preview (instructor):**
+
+```
+Browser                  NestJS (LecturesController)          PostgreSQL
+  |                                 |                               |
+  |-- PATCH …/lectures/:id          |                               |
+  |   { is_free_preview: true }     |                               |
+  |                           JwtAuthGuard validates token          |
+  |                           ValidationPipe validates DTO          |
+  |                                 |                               |
+  |                           verifySectionOwnership()              |
+  |                                 |-- SELECT section+course ----->|
+  |                                 |<-- { section, course, instr} -|
+  |                           check instructor + not PENDING        |
+  |                                 |                               |
+  |                                 |-- SELECT lecture WHERE id=:id >|
+  |                                 |<-- { lecture_id, … } ---------|
+  |                           lecture.is_free_preview = true        |
+  |                                 |-- UPDATE lectures SET … ------>|
+  |                                 |<-- updated row ---------------|
+  |<-- 200 { lecture_id, is_free_preview: true, … } ---------------|
+```
+
+**Non-enrolled visitor loads the public course page:**
+
+```
+Browser (no JWT)         NestJS (CoursesController)           PostgreSQL
+  |                                 |                               |
+  |-- GET /courses/:id/public ------>|                               |
+  |                           JwtAuthGuard sees @Public()           |
+  |                           → skips token validation              |
+  |                                 |                               |
+  |                           findPublicDetail(:id)                 |
+  |                                 |-- SELECT course WHERE         |
+  |                                 |   course_id=:id               |
+  |                                 |   AND status='published' ----->|
+  |                                 |<-- { course, instructor, cat}-|
+  |                                 |                               |
+  |                                 |-- SELECT sections WHERE ------>|
+  |                                 |   course_id=:id ORDER BY order|
+  |                                 |<-- [section-A, section-B] ----|
+  |                                 |                               |
+  |                           for each section:                     |
+  |                                 |-- SELECT lectures WHERE ------>|
+  |                                 |   section_id=:sid ORDER order |
+  |                                 |<-- [lecture-1, lecture-2] ----|
+  |                                 |                               |
+  |<-- 200 {                        |                               |
+  |      title, description,        |                               |
+  |      instructor_name,           |                               |
+  |      sections: [                |                               |
+  |        { title, lectures: [     |                               |
+  |          { title,               |                               |
+  |            is_free_preview: true/false }                        |
+  |        ]}                       |                               |
+  |      ]}                         |                               |
 ```

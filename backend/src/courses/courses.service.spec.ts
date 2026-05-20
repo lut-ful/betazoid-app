@@ -5,6 +5,8 @@ import { BadRequestException, ForbiddenException, NotFoundException } from '@nes
 import { CoursesService } from './courses.service';
 import { Course, CourseStatus, CourseLevel } from './entities/course.entity';
 import { Category } from '../categories/entities/category.entity';
+import { Section } from '../sections/entities/section.entity';
+import { Lecture, LectureContentType } from '../lectures/entities/lecture.entity';
 import { MailService } from '../mail/mail.service';
 import { RejectCourseDto } from './dto/reject-course.dto';
 import { SearchCoursesDto } from './dto/search-courses.dto';
@@ -30,6 +32,14 @@ const mockCourseRepo = () => ({
 
 const mockCategoryRepo = () => ({
     findOne: jest.fn(),
+});
+
+const mockSectionRepo = () => ({
+    find: jest.fn(),
+});
+
+const mockLectureRepo = () => ({
+    find: jest.fn(),
 });
 
 const mockMailService = () => ({
@@ -71,6 +81,8 @@ describe('CoursesService — submitForReview', () => {
                 CoursesService,
                 { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
                 { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: getRepositoryToken(Section), useFactory: mockSectionRepo },
+                { provide: getRepositoryToken(Lecture), useFactory: mockLectureRepo },
                 { provide: MailService, useFactory: mockMailService },
                 { provide: ConfigService, useFactory: mockConfigService },
             ],
@@ -197,6 +209,8 @@ describe('CoursesService — approveCourse', () => {
                 CoursesService,
                 { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
                 { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: getRepositoryToken(Section), useFactory: mockSectionRepo },
+                { provide: getRepositoryToken(Lecture), useFactory: mockLectureRepo },
                 { provide: MailService, useFactory: mockMailService },
                 { provide: ConfigService, useFactory: mockConfigService },
             ],
@@ -275,6 +289,8 @@ describe('CoursesService — rejectCourse', () => {
                 CoursesService,
                 { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
                 { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: getRepositoryToken(Section), useFactory: mockSectionRepo },
+                { provide: getRepositoryToken(Lecture), useFactory: mockLectureRepo },
                 { provide: MailService, useFactory: mockMailService },
                 { provide: ConfigService, useFactory: mockConfigService },
             ],
@@ -366,6 +382,8 @@ describe('CoursesService — search', () => {
                 CoursesService,
                 { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
                 { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: getRepositoryToken(Section), useFactory: mockSectionRepo },
+                { provide: getRepositoryToken(Lecture), useFactory: mockLectureRepo },
                 { provide: MailService, useFactory: mockMailService },
                 { provide: ConfigService, useFactory: mockConfigService },
             ],
@@ -472,5 +490,104 @@ describe('CoursesService — search', () => {
         const results = await service.search({ q: 'nonexistent topic' });
 
         expect(results).toEqual([]);
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// findPublicDetail
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('CoursesService — findPublicDetail', () => {
+    let service: CoursesService;
+    let courseRepo: ReturnType<typeof mockCourseRepo>;
+    let sectionRepo: ReturnType<typeof mockSectionRepo>;
+    let lectureRepo: ReturnType<typeof mockLectureRepo>;
+
+    const publishedCourse = (): Course => ({
+        ...baseCourse(),
+        status: CourseStatus.PUBLISHED,
+        instructor: { user_id: 'instructor-uuid-1', full_name: 'Jane Doe', email: 'jane@example.com' } as any,
+        category: { category_id: 'cat-1', name: 'Programming' } as any,
+    });
+
+    const baseSection = (): Section => ({
+        section_id: 'section-uuid-1',
+        title: 'Introduction',
+        order: 0,
+        course: publishedCourse(),
+        created_at: new Date(),
+        updated_at: new Date(),
+    });
+
+    const baseLecture = (): Lecture => ({
+        lecture_id: 'lecture-uuid-1',
+        title: 'Getting Started',
+        content_type: LectureContentType.VIDEO,
+        order: 0,
+        is_free_preview: true,
+        section: baseSection(),
+        created_at: new Date(),
+        updated_at: new Date(),
+    });
+
+    beforeEach(async () => {
+        const module: TestingModule = await Test.createTestingModule({
+            providers: [
+                CoursesService,
+                { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
+                { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: getRepositoryToken(Section), useFactory: mockSectionRepo },
+                { provide: getRepositoryToken(Lecture), useFactory: mockLectureRepo },
+                { provide: MailService, useFactory: mockMailService },
+                { provide: ConfigService, useFactory: mockConfigService },
+            ],
+        }).compile();
+
+        service = module.get(CoursesService);
+        courseRepo = module.get(getRepositoryToken(Course));
+        sectionRepo = module.get(getRepositoryToken(Section));
+        lectureRepo = module.get(getRepositoryToken(Lecture));
+    });
+
+    it('returns course detail with sections and lectures', async () => {
+        courseRepo.findOne.mockResolvedValue(publishedCourse());
+        sectionRepo.find.mockResolvedValue([baseSection()]);
+        lectureRepo.find.mockResolvedValue([baseLecture()]);
+
+        const result = await service.findPublicDetail('course-uuid-1');
+
+        expect(result.course_id).toBe('course-uuid-1');
+        expect(result.instructor_name).toBe('Jane Doe');
+        expect(result.category_name).toBe('Programming');
+        expect(result.sections).toHaveLength(1);
+        expect(result.sections[0].lectures).toHaveLength(1);
+        expect(result.sections[0].lectures[0].is_free_preview).toBe(true);
+    });
+
+    it('marks non-preview lectures with is_free_preview false', async () => {
+        courseRepo.findOne.mockResolvedValue(publishedCourse());
+        sectionRepo.find.mockResolvedValue([baseSection()]);
+        lectureRepo.find.mockResolvedValue([{ ...baseLecture(), is_free_preview: false }]);
+
+        const result = await service.findPublicDetail('course-uuid-1');
+
+        expect(result.sections[0].lectures[0].is_free_preview).toBe(false);
+    });
+
+    it('returns empty sections array when course has no sections', async () => {
+        courseRepo.findOne.mockResolvedValue(publishedCourse());
+        sectionRepo.find.mockResolvedValue([]);
+
+        const result = await service.findPublicDetail('course-uuid-1');
+
+        expect(result.sections).toEqual([]);
+    });
+
+    it('throws NotFoundException when course is not published', async () => {
+        courseRepo.findOne.mockResolvedValue(null);
+
+        await expect(
+            service.findPublicDetail('course-uuid-1'),
+        ).rejects.toBeInstanceOf(NotFoundException);
     });
 });

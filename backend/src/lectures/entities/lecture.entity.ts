@@ -30,6 +30,9 @@ export class Lecture {
     @Column({ type: 'int', default: 0 })
     order!: number;
 
+    @Column({ type: 'boolean', default: false })
+    is_free_preview!: boolean;
+
     @ManyToOne(() => Section, { onDelete: 'CASCADE' })
     @JoinColumn({ name: 'section_id' })
     section!: Section;

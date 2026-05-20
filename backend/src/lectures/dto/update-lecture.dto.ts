@@ -1,4 +1,4 @@
-import { IsEnum, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { IsBoolean, IsEnum, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import { LectureContentType } from '../entities/lecture.entity';
 
 export class UpdateLectureDto {
@@ -11,4 +11,8 @@ export class UpdateLectureDto {
     @IsOptional()
     @IsEnum(Object.values(LectureContentType))
     content_type?: LectureContentType;
+
+    @IsOptional()
+    @IsBoolean()
+    is_free_preview?: boolean;
 }

@@ -93,6 +93,7 @@ export class LecturesService {
 
         if (dto.title !== undefined) lecture.title = dto.title;
         if (dto.content_type !== undefined) lecture.content_type = dto.content_type;
+        if (dto.is_free_preview !== undefined) lecture.is_free_preview = dto.is_free_preview;
 
         return this.lectureRepo.save(lecture);
     }

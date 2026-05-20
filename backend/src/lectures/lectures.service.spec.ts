@@ -57,6 +57,7 @@ const baseLecture = (): Lecture => ({
     title: 'Getting Started',
     content_type: LectureContentType.VIDEO,
     order: 0,
+    is_free_preview: false,
     section: ownedSection(),
     created_at: new Date(),
     updated_at: new Date(),
@@ -264,6 +265,42 @@ describe('LecturesService — update', () => {
         await expect(
             service.update('course-uuid-1', 'section-uuid-1', 'lecture-uuid-1', { title: 'X' }, 'instructor-uuid-1'),
         ).rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    it('enables free preview on a lecture', async () => {
+        sectionRepo.findOne.mockResolvedValue(ownedSection());
+        const lecture = baseLecture();
+        lectureRepo.findOne.mockResolvedValue(lecture);
+        lectureRepo.save.mockResolvedValue({ ...lecture, is_free_preview: true });
+
+        const result = await service.update(
+            'course-uuid-1', 'section-uuid-1', 'lecture-uuid-1',
+            { is_free_preview: true },
+            'instructor-uuid-1',
+        );
+
+        expect(lectureRepo.save).toHaveBeenCalledWith(
+            expect.objectContaining({ is_free_preview: true }),
+        );
+        expect(result.is_free_preview).toBe(true);
+    });
+
+    it('disables free preview on a lecture', async () => {
+        sectionRepo.findOne.mockResolvedValue(ownedSection());
+        const lecture = { ...baseLecture(), is_free_preview: true };
+        lectureRepo.findOne.mockResolvedValue(lecture);
+        lectureRepo.save.mockResolvedValue({ ...lecture, is_free_preview: false });
+
+        const result = await service.update(
+            'course-uuid-1', 'section-uuid-1', 'lecture-uuid-1',
+            { is_free_preview: false },
+            'instructor-uuid-1',
+        );
+
+        expect(lectureRepo.save).toHaveBeenCalledWith(
+            expect.objectContaining({ is_free_preview: false }),
+        );
+        expect(result.is_free_preview).toBe(false);
     });
 });
 

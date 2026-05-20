@@ -13,7 +13,38 @@ import { UpdateCourseDto } from './dto/update-course.dto';
 import { RejectCourseDto } from './dto/reject-course.dto';
 import { SearchCoursesDto } from './dto/search-courses.dto';
 import { Category } from '../categories/entities/category.entity';
+import { Section } from '../sections/entities/section.entity';
+import { Lecture } from '../lectures/entities/lecture.entity';
 import { MailService } from '../mail/mail.service';
+
+export interface PublicLecture {
+    lecture_id: string;
+    title: string;
+    content_type: string;
+    order: number;
+    is_free_preview: boolean;
+}
+
+export interface PublicSection {
+    section_id: string;
+    title: string;
+    order: number;
+    lectures: PublicLecture[];
+}
+
+export interface PublicCourseDetail {
+    course_id: string;
+    title: string;
+    description: string;
+    price: number;
+    thumbnail_url: string | null;
+    language: string;
+    level: string;
+    rating: number;
+    instructor_name: string;
+    category_name: string | null;
+    sections: PublicSection[];
+}
 
 export interface CourseSearchResult {
     course_id: string;
@@ -34,6 +65,10 @@ export class CoursesService {
         private readonly courseRepo: Repository<Course>,
         @InjectRepository(Category)
         private readonly categoryRepo: Repository<Category>,
+        @InjectRepository(Section)
+        private readonly sectionRepo: Repository<Section>,
+        @InjectRepository(Lecture)
+        private readonly lectureRepo: Repository<Lecture>,
         private readonly mailService: MailService,
         private readonly config: ConfigService,
     ) {}
@@ -253,6 +288,54 @@ export class CoursesService {
             rating: parseFloat(c.rating as unknown as string),
             thumbnail_url: c.thumbnail_url,
         }));
+    }
+
+    async findPublicDetail(courseId: string): Promise<PublicCourseDetail> {
+        const course = await this.courseRepo.findOne({
+            where: { course_id: courseId, status: CourseStatus.PUBLISHED },
+            relations: ['instructor', 'category'],
+        });
+        if (!course) throw new NotFoundException('Course not found');
+
+        const sections = await this.sectionRepo.find({
+            where: { course: { course_id: courseId } },
+            order: { order: 'ASC' },
+        });
+
+        const sectionsWithLectures: PublicSection[] = await Promise.all(
+            sections.map(async (section) => {
+                const lectures = await this.lectureRepo.find({
+                    where: { section: { section_id: section.section_id } },
+                    order: { order: 'ASC' },
+                });
+                return {
+                    section_id: section.section_id,
+                    title: section.title,
+                    order: section.order,
+                    lectures: lectures.map((l) => ({
+                        lecture_id: l.lecture_id,
+                        title: l.title,
+                        content_type: l.content_type,
+                        order: l.order,
+                        is_free_preview: l.is_free_preview,
+                    })),
+                };
+            }),
+        );
+
+        return {
+            course_id: course.course_id,
+            title: course.title,
+            description: course.description,
+            price: parseFloat(course.price as unknown as string),
+            thumbnail_url: course.thumbnail_url,
+            language: course.language,
+            level: course.level,
+            rating: parseFloat(course.rating as unknown as string),
+            instructor_name: course.instructor.full_name,
+            category_name: course.category?.name ?? null,
+            sections: sectionsWithLectures,
+        };
     }
 
     async rejectCourse(courseId: string, dto: RejectCourseDto): Promise<Course> {

@@ -23,6 +23,7 @@ interface Lecture {
     title: string;
     content_type: ContentType;
     order: number;
+    is_free_preview: boolean;
 }
 
 const addLectureSchema = z.object({
@@ -97,6 +98,14 @@ export default function LecturesPage() {
     const reorderMutation = useMutation({
         mutationFn: (orderedIds: string[]) =>
             api.post(`/courses/${courseId}/sections/${sectionId}/lectures/reorder`, { orderedIds }),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
+        },
+    });
+
+    const togglePreviewMutation = useMutation({
+        mutationFn: ({ lectureId, is_free_preview }: { lectureId: string; is_free_preview: boolean }) =>
+            api.patch(`/courses/${courseId}/sections/${sectionId}/lectures/${lectureId}`, { is_free_preview }),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
         },
@@ -213,6 +222,11 @@ export default function LecturesPage() {
                                             <span className="text-muted-foreground">
                                                 [{lecture.content_type}]
                                             </span>
+                                            {lecture.is_free_preview && (
+                                                <span className="ml-2 text-xs border border-border px-1 rounded">
+                                                    Free Preview
+                                                </span>
+                                            )}
                                         </span>
                                     )}
 
@@ -236,6 +250,19 @@ export default function LecturesPage() {
                                                 onClick={() => moveLecture(index, 'down')}
                                             >
                                                 ↓
+                                            </Button>
+                                            <Button
+                                                size="sm"
+                                                variant="outline"
+                                                disabled={togglePreviewMutation.isPending}
+                                                onClick={() =>
+                                                    togglePreviewMutation.mutate({
+                                                        lectureId: lecture.lecture_id,
+                                                        is_free_preview: !lecture.is_free_preview,
+                                                    })
+                                                }
+                                            >
+                                                {lecture.is_free_preview ? 'Remove Preview' : 'Set Preview'}
                                             </Button>
                                             <Button
                                                 size="sm"
