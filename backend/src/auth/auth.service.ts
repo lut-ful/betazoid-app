@@ -21,7 +21,7 @@ export class AuthService {
         @InjectDataSource()
         private dataSource: DataSource,
         private mailService: MailService,
-        private jwtService:JwtService
+        private jwtService: JwtService
     ) { }
 
     async register(dto: RegisterDto): Promise<{ message: string }> {
@@ -58,51 +58,60 @@ export class AuthService {
         return { message: 'Registration successful. Check your email.' };
     }
 
-private hashToken(token: string): string {
-    return crypto.createHash('sha256').update(token).digest('hex');
-}
-
-private async generateTokens(user: User): Promise<{ accessToken: string; refreshToken: string }> {
-    const accessToken = this.jwtService.sign({ sub: user.user_id, email: user.email });
-
-    const refreshToken = crypto.randomUUID();
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 7);
-
-    await this.userRepository.update(user.user_id, {
-        refresh_token_hash: this.hashToken(refreshToken),
-        refresh_token_expires_at: expiresAt,
-    });
-
-    return { accessToken, refreshToken };
-}
-
-async login(dto: LoginDto): Promise<{ accessToken: string; refreshToken: string }> {
-    const user = await this.userRepository.findOne({ where: { email: dto.email } });
-    if (!user) {
-        throw new UnauthorizedException('Invalid credentials');
+    private hashToken(token: string): string {
+        return crypto.createHash('sha256').update(token).digest('hex');
     }
 
-    const passwordMatches = await bcrypt.compare(dto.password, user.password_hash);
-    if (!passwordMatches) {
-        throw new UnauthorizedException('Invalid credentials');
+    private async generateTokens(user: User): Promise<{ accessToken: string; refreshToken: string }> {
+        const accessToken = this.jwtService.sign({ sub: user.user_id, email: user.email });
+
+        const refreshToken = crypto.randomUUID();
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 7);
+
+        await this.userRepository.update(user.user_id, {
+            refresh_token_hash: this.hashToken(refreshToken),
+            refresh_token_expires_at: expiresAt,
+        });
+
+        return { accessToken, refreshToken };
     }
 
-    return this.generateTokens(user);
-}
+    async login(dto: LoginDto): Promise<{ accessToken: string; refreshToken: string }> {
+        const user = await this.userRepository.findOne({ where: { email: dto.email } });
+        if (!user) {
+            throw new UnauthorizedException('Invalid credentials');
+        }
 
-async refresh(incomingToken: string): Promise<{ accessToken: string; refreshToken: string }> {
-    const tokenHash = this.hashToken(incomingToken);
+        const passwordMatches = await bcrypt.compare(dto.password, user.password_hash);
+        if (!passwordMatches) {
+            throw new UnauthorizedException('Invalid credentials');
+        }
 
-    const user = await this.userRepository.findOne({
-        where: { refresh_token_hash: tokenHash },
-    });
-
-    if (!user || !user.refresh_token_expires_at || user.refresh_token_expires_at < new Date()) {
-        throw new UnauthorizedException('Invalid or expired refresh token');
+        return this.generateTokens(user);
     }
 
-    return this.generateTokens(user);
-}
+    async refresh(incomingToken: string): Promise<{ accessToken: string; refreshToken: string }> {
+        const tokenHash = this.hashToken(incomingToken);
+
+        const user = await this.userRepository.findOne({
+            where: { refresh_token_hash: tokenHash },
+        });
+
+        if (!user || !user.refresh_token_expires_at || user.refresh_token_expires_at < new Date()) {
+            throw new UnauthorizedException('Invalid or expired refresh token');
+        }
+
+        return this.generateTokens(user);
+    }
+    
+    async logout(userId: string): Promise<{ message: string }> {
+        await this.userRepository.update(userId, {
+            refresh_token_hash: null,
+            refresh_token_expires_at: null,
+        });
+        return { message: 'Logged out successfully' };
+    }
+
 
 }

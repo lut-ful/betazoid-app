@@ -552,32 +552,237 @@ This interceptor catches every `401 Unauthorized` response, silently calls `/aut
 
 ---
 
-### 4.1 What logout does
+### 4.1 Theory — Why JWT logout is harder than it sounds
+
+With traditional session-based auth, logout is simple: delete the session record from the database or Redis and the user is immediately locked out.
+
+With stateless JWTs it's different. The server does not store the access token anywhere — it just issues it and trusts the signature. There is no list to check against, no session to delete. **Once an access token is issued, you cannot un-issue it.** It will be accepted by every protected endpoint until its `exp` timestamp passes.
+
+This creates a dilemma:
+
+| Token | Lives in | Can server invalidate? | Lifespan |
+|---|---|---|---|
+| Access token | JS memory (Zustand) | No — stateless | 15 minutes |
+| Refresh token | HTTP-only cookie + DB (as hash) | **Yes** — stored in DB | 7 days |
+
+The standard solution: **kill the refresh token in the DB**. The access token will still work for up to 15 minutes after logout — that is an accepted trade-off of stateless JWT auth. But once it expires, the attacker cannot get a new one because the refresh token is gone.
 
 ```
-POST /api/v1/auth/logout
-Headers: Authorization: Bearer <access_token>   (protected route)
-
-1. JwtAuthGuard validates the access token → gets req.user.userId
-2. AuthService: UPDATE users SET refresh_token_hash = NULL, refresh_token_expires_at = NULL
-   WHERE user_id = req.user.userId
-3. Clear the refresh_token cookie (set maxAge: 0)
-4. Return { message: 'Logged out' }
+After logout:
+  - Refresh token hash → NULL in DB
+  - Access token → still cryptographically valid, but expires in ≤ 15 min
+  - No new access tokens can be issued → session is effectively dead
 ```
 
-**Why not invalidate the access token?** Access tokens are stateless — there is no list to check against. Once issued, they're valid until they expire. This is the known trade-off of stateless JWTs. The standard solution: keep access tokens short-lived (15 min) so the damage window is small. Some systems maintain a "token blocklist" in Redis for immediate invalidation if needed.
-
-Nullifying the refresh token in the DB ensures no new access tokens can be obtained after logout.
+If immediate invalidation is ever required (e.g. "lock this account now"), the solution is a Redis token blocklist — but that's out of scope for this sprint.
 
 ---
 
-### 4.2 Frontend logout
+### 4.2 Backend — The logout endpoint
+
+**Route:** `POST /api/v1/auth/logout`
+
+This endpoint is **protected** — it requires a valid access token. Without the guard, anyone could call it and you'd have no way of knowing whose session to destroy.
+
+```
+POST /api/v1/auth/logout
+Headers: Authorization: Bearer <access_token>
+
+1. JwtAuthGuard verifies the JWT signature and expiry
+2. JwtStrategy.validate() decodes payload → { sub: user_id, email }
+3. NestJS attaches the result to req.user
+4. Controller reads req.user.sub (the user_id)
+5. AuthService.logout(userId) → UPDATE users SET refresh_token_hash = NULL,
+                                                 refresh_token_expires_at = NULL
+                                  WHERE user_id = ?
+6. res.clearCookie('refresh_token', ...) → tells browser to delete the cookie
+7. Return { message: 'Logged out successfully' }
+```
+
+#### Controller (`auth.controller.ts`)
 
 ```typescript
-// On logout:
-await axios.post('/api/v1/auth/logout');   // clears cookie + nulls DB token
-clearAccessToken();                          // clears Zustand store
-router.push('/login');
+@Post('logout')
+@HttpCode(HttpStatus.OK)
+@UseGuards(JwtAuthGuard)           // ← requires valid Bearer token
+async logout(
+    @Req() req: Request & { user: { sub: string } },
+    @Res({ passthrough: true }) res: Response,
+) {
+    await this.authService.logout(req.user.sub);   // sub = user_id from JWT payload
+    res.clearCookie('refresh_token', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+    });
+    return { message: 'Logged out successfully' };
+}
+```
+
+**Three things to understand:**
+
+**`@UseGuards(JwtAuthGuard)` before `@Post`** — decorator order matters in NestJS. The guard runs before the handler. If the token is missing or expired, the guard throws `401 Unauthorized` and your handler never executes.
+
+**`req.user.sub`** — Passport attaches whatever `JwtStrategy.validate()` returns to `req.user`. Your strategy returns `{ userId: payload.sub, email: payload.email }` — but that was typed loosely. The `& { user: { sub: string } }` type cast in the parameter tells TypeScript the shape of the injected object so it doesn't complain about accessing `.sub`.
+
+**`res.clearCookie(options)`** — The cookie options passed to `clearCookie` must exactly match those used when the cookie was set (`setRefreshCookie`). If they differ, the browser treats them as different cookies and the old one is not deleted. `httpOnly`, `secure`, and `sameSite` must all match.
+
+#### Service (`auth.service.ts`)
+
+```typescript
+async logout(userId: string): Promise<{ message: string }> {
+    await this.userRepository.update(userId, {
+        refresh_token_hash: null,
+        refresh_token_expires_at: null,
+    });
+    return { message: 'Logged out successfully' };
+}
+```
+
+This is intentionally simple. TypeORM's `update()` runs:
+```sql
+UPDATE users SET refresh_token_hash = NULL, refresh_token_expires_at = NULL
+WHERE user_id = $1
+```
+
+No lookup needed before the update — if the user doesn't exist, the update affects zero rows and that's fine. No error is thrown.
+
+#### Entity fix required (`user.entity.ts`)
+
+To pass `null` in the `update()` call above, the entity columns must be declared as nullable in three matching ways:
+
+```typescript
+@Column({ type: 'varchar', nullable: true })   // ① tell TypeORM the DB column allows NULL
+refresh_token_hash: string | null;              // ② tell TypeScript null is a valid value
+
+@Column({ type: 'timestamp', nullable: true })  // ① same for the expiry column
+refresh_token_expires_at: Date | null;          // ②
+```
+
+**Why `type: 'varchar'` is required explicitly:**
+TypeScript union types (`string | null`) compile down to `Object` in the `reflect-metadata` output that TypeORM reads at runtime to determine the SQL column type. If you write `@Column({ nullable: true })` without `type`, TypeORM sees `Object` and throws:
+
+```
+DataTypeNotSupportedError: Data type "Object" in "User.refresh_token_hash"
+is not supported by "postgres" database.
+```
+
+The explicit `type: 'varchar'` bypasses the reflection and gives TypeORM the correct information directly.
+
+---
+
+### 4.3 Frontend — The logout button (`frontend/src/app/page.tsx`)
+
+```typescript
+'use client';
+
+import { useRouter } from 'next/navigation';
+import { useAuthStore } from '@/store/auth.store';
+import api from '@/lib/axios';
+
+export default function LogoutButton() {
+    const router = useRouter();
+    const clearAccessToken = useAuthStore((s) => s.clearAccessToken);
+
+    async function handleLogout() {
+        try {
+            await api.post('/auth/logout');     // kills refresh token in DB + clears cookie
+        } catch {
+            // Server may have already rejected the token — doesn't matter.
+            // Client state must be cleared regardless.
+        } finally {
+            clearAccessToken();                 // wipes access token from Zustand store
+            router.push('/login');              // redirect
+        }
+    }
+
+    return (
+        <button onClick={handleLogout}>
+            Logout
+        </button>
+    );
+}
+```
+
+**`'use client'`** — This directive is required at the top of any Next.js file that uses React hooks (`useRouter`, `useAuthStore`) or browser-only APIs. Files without it are treated as React Server Components, which cannot run hooks.
+
+**`try / catch / finally` — why `finally`?**
+
+The `finally` block runs regardless of whether the `try` succeeded or the `catch` handled an error. This is the key design decision:
+
+```
+Scenario A — happy path:
+  api.post('/auth/logout') → 200 OK
+  finally: clearAccessToken() + router.push('/login')   ✓
+
+Scenario B — token already expired:
+  api.post('/auth/logout') → 401 (access token expired)
+  catch: (ignored)
+  finally: clearAccessToken() + router.push('/login')   ✓ still logs out!
+
+Scenario C — network error / server down:
+  api.post('/auth/logout') → network error
+  catch: (ignored)
+  finally: clearAccessToken() + router.push('/login')   ✓ still logs out!
+```
+
+Without `finally`, a network error in scenario C would leave the user stuck — their access token in Zustand would remain, and they'd still appear logged in on the client even though they clicked Logout.
+
+**`clearAccessToken()`** — this calls `set({ accessToken: null })` in the Zustand store. The axios request interceptor reads `useAuthStore.getState().accessToken` on every request — once it's `null`, no `Authorization` header is attached. The user is effectively unauthenticated from the frontend's perspective.
+
+**Two-sided cleanup:**
+
+| What gets cleaned | Where | Effect |
+|---|---|---|
+| `refresh_token_hash` | Database (via `POST /auth/logout`) | Cannot get new access tokens |
+| `refresh_token` cookie | Browser (via `res.clearCookie`) | Cookie no longer sent to server |
+| `accessToken` | Zustand store in JS memory | No Authorization header on requests |
+
+---
+
+### 4.4 Security Notes
+
+**The 15-minute window.** After logout the access token is still cryptographically valid until it expires. If an attacker stole it before logout, they have up to 15 minutes of access. This is the fundamental trade-off of stateless JWT auth. Mitigation: keep access token TTL short (15 min is standard).
+
+**Why the endpoint requires authentication.** The `@UseGuards(JwtAuthGuard)` requirement might seem odd — why does logging out need a valid token? Because the server needs to know *whose* `refresh_token_hash` to null. Without a token, it has no identity. An unauthenticated logout request would have nothing to clean up.
+
+**What happens if the access token expired before logout?** The axios interceptor in `lib/axios.ts` catches the `401`, silently calls `/auth/refresh`, gets a new access token, and retries the `/auth/logout` call. The user never sees this — logout still works transparently even if their token had just expired.
+
+---
+
+### 4.5 The full flow
+
+```
+Browser                      NestJS Backend               PostgreSQL
+   |                               |                           |
+   | POST /api/v1/auth/logout      |                           |
+   | Authorization: Bearer <JWT>   |                           |
+   | Cookie: refresh_token=<tok>   |                           |
+   |-----------------------------> |                           |
+   |                          JwtAuthGuard                     |
+   |                          verifies JWT signature + expiry  |
+   |                          decodes payload → { sub, email } |
+   |                          attaches to req.user             |
+   |                               |                           |
+   |                          AuthService.logout(req.user.sub) |
+   |                               |--- UPDATE users --------> |
+   |                               |    SET                    |
+   |                               |    refresh_token_hash=NULL|
+   |                               |    refresh_token_exp=NULL |
+   |                               |    WHERE user_id=$1       |
+   |                               | <------------------------ |
+   |                               |                           |
+   |                          res.clearCookie('refresh_token') |
+   |                               |                           |
+   | 200 { message: 'Logged out' } |                           |
+   | Set-Cookie: refresh_token=;   |                           |
+   |   Max-Age=0; HttpOnly         |                           |
+   | <---------------------------- |                           |
+   |                               |                           |
+   | clearAccessToken()            |                           |
+   | (Zustand → accessToken=null)  |                           |
+   |                               |                           |
+   | router.push('/login')         |                           |
 ```
 
 ---
