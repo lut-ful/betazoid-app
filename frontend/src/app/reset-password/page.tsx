@@ -8,6 +8,10 @@ import { z } from 'zod';
 import { useMutation } from '@tanstack/react-query';
 import Link from 'next/link';
 import api from '@/lib/axios';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
 const schema = z
     .object({
@@ -26,11 +30,7 @@ function ResetPasswordForm() {
     const searchParams = useSearchParams();
     const token = searchParams.get('token');
 
-    const {
-        register,
-        handleSubmit,
-        formState: { errors },
-    } = useForm<FormData>({
+    const { register, handleSubmit, formState: { errors } } = useForm<FormData>({
         resolver: zodResolver(schema),
     });
 
@@ -47,44 +47,49 @@ function ResetPasswordForm() {
 
     if (!token) {
         return (
-            <div>
-                <p>Invalid reset link.</p>
-                <Link href="/forgot-password">Request a new one</Link>
+            <div className="space-y-3">
+                <p className="text-sm text-destructive">Invalid or missing reset link.</p>
+                <Link href="/forgot-password" className="text-sm">Request a new reset link</Link>
             </div>
         );
     }
 
     return (
-        <div>
-            <h1>Reset Password</h1>
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+            <div className="space-y-1">
+                <Label htmlFor="new_password">New Password</Label>
+                <Input id="new_password" type="password" {...register('new_password')} />
+                {errors.new_password && <p className="text-sm text-destructive">{errors.new_password.message}</p>}
+            </div>
 
-            <form onSubmit={handleSubmit(onSubmit)}>
-                <div>
-                    <label>New Password</label>
-                    <input type="password" {...register('new_password')} />
-                    {errors.new_password && <p>{errors.new_password.message}</p>}
-                </div>
+            <div className="space-y-1">
+                <Label htmlFor="confirm_password">Confirm Password</Label>
+                <Input id="confirm_password" type="password" {...register('confirm_password')} />
+                {errors.confirm_password && <p className="text-sm text-destructive">{errors.confirm_password.message}</p>}
+            </div>
 
-                <div>
-                    <label>Confirm Password</label>
-                    <input type="password" {...register('confirm_password')} />
-                    {errors.confirm_password && <p>{errors.confirm_password.message}</p>}
-                </div>
+            {mutation.isError && <p className="text-sm text-destructive">Invalid or expired reset link.</p>}
 
-                <button type="submit" disabled={mutation.isPending}>
-                    {mutation.isPending ? 'Updating...' : 'Reset Password'}
-                </button>
-
-                {mutation.isError && <p>Invalid or expired reset link.</p>}
-            </form>
-        </div>
+            <Button type="submit" className="w-full" disabled={mutation.isPending}>
+                {mutation.isPending ? 'Updating...' : 'Reset Password'}
+            </Button>
+        </form>
     );
 }
 
 export default function ResetPasswordPage() {
     return (
-        <Suspense fallback={<p>Loading...</p>}>
-            <ResetPasswordForm />
-        </Suspense>
+        <div className="max-w-md mx-auto px-4 py-12">
+            <Card>
+                <CardHeader>
+                    <CardTitle>Reset Password</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    <Suspense fallback={<p className="text-sm text-muted-foreground">Loading...</p>}>
+                        <ResetPasswordForm />
+                    </Suspense>
+                </CardContent>
+            </Card>
+        </div>
     );
 }

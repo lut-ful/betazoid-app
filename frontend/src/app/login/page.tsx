@@ -5,13 +5,16 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useRouter } from 'next/navigation';
 import { useState } from 'react';
+import Link from 'next/link';
 import api from '@/lib/axios';
 import { useAuthStore } from '@/store/auth.store';
-import Link from 'next/link';
-
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 
 const loginSchema = z.object({
-    email: z.string().email('Invalid email'),
+    email: z.email('Invalid email'),
     password: z.string().min(8, 'Password must be at least 8 characters'),
 });
 
@@ -22,11 +25,7 @@ export default function LoginPage() {
     const router = useRouter();
     const setAccessToken = useAuthStore((state) => state.setAccessToken);
 
-    const {
-        register,
-        handleSubmit,
-        formState: { errors, isSubmitting },
-    } = useForm<LoginFormData>({
+    const { register, handleSubmit, formState: { errors, isSubmitting } } = useForm<LoginFormData>({
         resolver: zodResolver(loginSchema),
     });
 
@@ -43,25 +42,38 @@ export default function LoginPage() {
     };
 
     return (
-        <div>
-            <h1>Sign In</h1>
-            <form onSubmit={handleSubmit(onSubmit)}>
-                <div>
-                    <label>Email</label>
-                    <input type="email" {...register('email')} />
-                    {errors.email && <p>{errors.email.message}</p>}
-                </div>
-                <div>
-                    <label>Password</label>
-                    <input type="password" {...register('password')} />
-                    {errors.password && <p>{errors.password.message}</p>}
-                </div>
-                {errorMessage && <p style={{ color: 'red' }}>{errorMessage}</p>}
-                <button type="submit" disabled={isSubmitting}>
-                    {isSubmitting ? 'Signing in...' : 'Sign In'}
-                </button>
-                <Link href="/forgot-password">Forgot password?</Link>
-            </form>
+        <div className="max-w-md mx-auto px-4 py-12">
+            <Card>
+                <CardHeader>
+                    <CardTitle>Sign In</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+                        <div className="space-y-1">
+                            <Label htmlFor="email">Email</Label>
+                            <Input id="email" type="email" {...register('email')} />
+                            {errors.email && <p className="text-sm text-destructive">{errors.email.message}</p>}
+                        </div>
+
+                        <div className="space-y-1">
+                            <Label htmlFor="password">Password</Label>
+                            <Input id="password" type="password" {...register('password')} />
+                            {errors.password && <p className="text-sm text-destructive">{errors.password.message}</p>}
+                        </div>
+
+                        {errorMessage && <p className="text-sm text-destructive">{errorMessage}</p>}
+
+                        <Button type="submit" className="w-full" disabled={isSubmitting}>
+                            {isSubmitting ? 'Signing in...' : 'Sign In'}
+                        </Button>
+
+                        <div className="flex justify-between text-sm">
+                            <Link href="/forgot-password">Forgot password?</Link>
+                            <Link href="/register">Create an account</Link>
+                        </div>
+                    </form>
+                </CardContent>
+            </Card>
         </div>
     );
 }

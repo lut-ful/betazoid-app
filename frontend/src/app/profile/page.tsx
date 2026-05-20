@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
@@ -12,11 +12,12 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Separator } from '@/components/ui/separator';
 
 const profileSchema = z.object({
     full_name: z.string().min(1, 'Name is required').max(100),
     bio: z.string().max(500).optional(),
-    profile_photo_url: z.string().url('Must be a valid URL').optional().or(z.literal('')),
 });
 
 type ProfileFormData = z.infer<typeof profileSchema>;
@@ -36,7 +37,9 @@ interface UserProfile {
 export default function ProfilePage() {
     const router = useRouter();
     const accessToken = useAuthStore((s) => s.accessToken);
+    const clearAccessToken = useAuthStore((s) => s.clearAccessToken);
     const queryClient = useQueryClient();
+    const [confirmDelete, setConfirmDelete] = useState(false);
 
     useEffect(() => {
         if (!accessToken) router.push('/login');
@@ -60,66 +63,117 @@ export default function ProfilePage() {
             reset({
                 full_name: profile.full_name,
                 bio: profile.bio ?? '',
-                profile_photo_url: profile.profile_photo_url ?? '',
             });
         }
     }, [profile, reset]);
 
     const mutation = useMutation({
-        mutationFn: (data: ProfileFormData) => {
-            const payload: Partial<ProfileFormData> = { full_name: data.full_name };
-            if (data.bio !== undefined) payload.bio = data.bio;
-            if (data.profile_photo_url) payload.profile_photo_url = data.profile_photo_url;
-            return api.patch('/users/me', payload);
-        },
+        mutationFn: (data: ProfileFormData) =>
+            api.patch('/users/me', data),
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['profile'] });
         },
     });
 
+    const deleteMutation = useMutation({
+        mutationFn: () => api.delete('/users/me'),
+        onSuccess: () => {
+            clearAccessToken();
+            router.push('/register');
+        },
+    });
+
     const onSubmit = (data: ProfileFormData) => mutation.mutate(data);
 
-    if (isLoading) return <p>Loading...</p>;
-    if (isError) return <p>Failed to load profile.</p>;
+    if (isLoading) return <p className="p-8 text-muted-foreground">Loading...</p>;
+    if (isError) return <p className="p-8 text-destructive">Failed to load profile.</p>;
 
     return (
-        <div className="max-w-lg mx-auto mt-10 p-6">
-            <h1 className="text-2xl font-bold mb-6">My Profile</h1>
+        <div className="max-w-lg mx-auto px-4 py-10 space-y-6">
+            <h1 className="text-xl font-semibold">My Profile</h1>
 
-            <div className="mb-4">
-                <Label>Gmail (read-only)</Label>
-                <Input value={profile?.gmail ?? ''} disabled />
-                <p className="text-sm text-muted-foreground mt-1">
-                    Gmail cannot be changed — it controls your YouTube course access.
-                </p>
-            </div>
+            <Card>
+                <CardHeader>
+                    <CardTitle>Account Info</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                        <span className="text-muted-foreground">Email</span>
+                        <span>{profile?.email}</span>
+                    </div>
+                    <Separator />
+                    <div className="flex justify-between">
+                        <span className="text-muted-foreground">Gmail</span>
+                        <span>{profile?.gmail}</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground pt-1">
+                        Gmail cannot be changed — it controls your YouTube course access.
+                    </p>
+                </CardContent>
+            </Card>
 
-            <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
-                <div>
-                    <Label htmlFor="full_name">Full Name</Label>
-                    <Input id="full_name" {...register('full_name')} />
-                    {errors.full_name && <p className="text-sm text-red-500">{errors.full_name.message}</p>}
-                </div>
+            <Card>
+                <CardHeader>
+                    <CardTitle>Edit Profile</CardTitle>
+                </CardHeader>
+                <CardContent>
+                    <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+                        <div className="space-y-1">
+                            <Label htmlFor="full_name">Full Name</Label>
+                            <Input id="full_name" {...register('full_name')} />
+                            {errors.full_name && <p className="text-sm text-destructive">{errors.full_name.message}</p>}
+                        </div>
 
-                <div>
-                    <Label htmlFor="bio">Bio</Label>
-                    <Textarea id="bio" {...register('bio')} rows={4} />
-                    {errors.bio && <p className="text-sm text-red-500">{errors.bio.message}</p>}
-                </div>
+                        <div className="space-y-1">
+                            <Label htmlFor="bio">Bio</Label>
+                            <Textarea id="bio" {...register('bio')} rows={4} />
+                            {errors.bio && <p className="text-sm text-destructive">{errors.bio.message}</p>}
+                        </div>
 
-                <div>
-                    <Label htmlFor="profile_photo_url">Profile Photo URL</Label>
-                    <Input id="profile_photo_url" {...register('profile_photo_url')} placeholder="https://..." />
-                    {errors.profile_photo_url && <p className="text-sm text-red-500">{errors.profile_photo_url.message}</p>}
-                </div>
+                        {mutation.isSuccess && <p className="text-sm">Profile updated successfully.</p>}
+                        {mutation.isError && <p className="text-sm text-destructive">Failed to update profile.</p>}
 
-                {mutation.isSuccess && <p className="text-sm text-green-600">Profile updated successfully.</p>}
-                {mutation.isError && <p className="text-sm text-red-500">Failed to update profile.</p>}
+                        <Button type="submit" disabled={mutation.isPending}>
+                            {mutation.isPending ? 'Saving...' : 'Save Changes'}
+                        </Button>
+                    </form>
+                </CardContent>
+            </Card>
 
-                <Button type="submit" disabled={mutation.isPending}>
-                    {mutation.isPending ? 'Saving...' : 'Save Changes'}
-                </Button>
-            </form>
+            <Card>
+                <CardHeader>
+                    <CardTitle>Delete Account</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                    <p className="text-sm text-muted-foreground">
+                        Permanently deletes your account. This cannot be undone.
+                    </p>
+                    {!confirmDelete ? (
+                        <Button variant="destructive" onClick={() => setConfirmDelete(true)}>
+                            Delete Account
+                        </Button>
+                    ) : (
+                        <div className="space-y-2">
+                            <p className="text-sm text-destructive">Are you sure? This action is permanent.</p>
+                            <div className="flex gap-2">
+                                <Button
+                                    variant="destructive"
+                                    disabled={deleteMutation.isPending}
+                                    onClick={() => deleteMutation.mutate()}
+                                >
+                                    {deleteMutation.isPending ? 'Deleting...' : 'Yes, delete my account'}
+                                </Button>
+                                <Button variant="outline" onClick={() => setConfirmDelete(false)}>
+                                    Cancel
+                                </Button>
+                            </div>
+                            {deleteMutation.isError && (
+                                <p className="text-sm text-destructive">Failed to delete account. Please try again.</p>
+                            )}
+                        </div>
+                    )}
+                </CardContent>
+            </Card>
         </div>
     );
 }
