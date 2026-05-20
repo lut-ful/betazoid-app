@@ -15,22 +15,28 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 
-interface Section {
-    section_id: string;
+const CONTENT_TYPES = ['video', 'article', 'quiz'] as const;
+type ContentType = (typeof CONTENT_TYPES)[number];
+
+interface Lecture {
+    lecture_id: string;
     title: string;
+    content_type: ContentType;
     order: number;
 }
 
-const addSectionSchema = z.object({
+const addLectureSchema = z.object({
     title: z.string().min(1, 'Title is required').max(200),
+    content_type: z.enum(CONTENT_TYPES),
 });
 
-type AddSectionForm = z.infer<typeof addSectionSchema>;
+type AddLectureForm = z.infer<typeof addLectureSchema>;
 
-export default function SectionsPage() {
+export default function LecturesPage() {
     const router = useRouter();
     const params = useParams();
     const courseId = params.id as string;
+    const sectionId = params.sectionId as string;
     const accessToken = useAuthStore((s) => s.accessToken);
     const queryClient = useQueryClient();
 
@@ -42,13 +48,13 @@ export default function SectionsPage() {
         if (!accessToken) router.push('/login');
     }, [accessToken, router]);
 
-    const { data: sections, isLoading, isError } = useQuery<Section[]>({
-        queryKey: ['sections', courseId],
+    const { data: lectures, isLoading, isError } = useQuery<Lecture[]>({
+        queryKey: ['lectures', courseId, sectionId],
         queryFn: async () => {
-            const { data } = await api.get(`/courses/${courseId}/sections`);
+            const { data } = await api.get(`/courses/${courseId}/sections/${sectionId}/lectures`);
             return data;
         },
-        enabled: !!accessToken && !!courseId,
+        enabled: !!accessToken && !!courseId && !!sectionId,
     });
 
     const {
@@ -56,66 +62,70 @@ export default function SectionsPage() {
         handleSubmit,
         reset,
         formState: { errors },
-    } = useForm<AddSectionForm>({ resolver: zodResolver(addSectionSchema) });
+    } = useForm<AddLectureForm>({
+        resolver: zodResolver(addLectureSchema),
+        defaultValues: { content_type: 'video' },
+    });
 
     const addMutation = useMutation({
-        mutationFn: (data: AddSectionForm) => api.post(`/courses/${courseId}/sections`, data),
+        mutationFn: (data: AddLectureForm) =>
+            api.post(`/courses/${courseId}/sections/${sectionId}/lectures`, data),
         onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['sections', courseId] });
-            reset();
+            queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
+            reset({ content_type: 'video' });
         },
     });
 
     const renameMutation = useMutation({
-        mutationFn: ({ sectionId, title }: { sectionId: string; title: string }) =>
-            api.patch(`/courses/${courseId}/sections/${sectionId}`, { title }),
+        mutationFn: ({ lectureId, title }: { lectureId: string; title: string }) =>
+            api.patch(`/courses/${courseId}/sections/${sectionId}/lectures/${lectureId}`, { title }),
         onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['sections', courseId] });
+            queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
             setEditingId(null);
         },
     });
 
     const deleteMutation = useMutation({
-        mutationFn: (sectionId: string) =>
-            api.delete(`/courses/${courseId}/sections/${sectionId}`),
+        mutationFn: (lectureId: string) =>
+            api.delete(`/courses/${courseId}/sections/${sectionId}/lectures/${lectureId}`),
         onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['sections', courseId] });
+            queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
             setConfirmDeleteId(null);
         },
     });
 
     const reorderMutation = useMutation({
         mutationFn: (orderedIds: string[]) =>
-            api.post(`/courses/${courseId}/sections/reorder`, { orderedIds }),
+            api.post(`/courses/${courseId}/sections/${sectionId}/lectures/reorder`, { orderedIds }),
         onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ['sections', courseId] });
+            queryClient.invalidateQueries({ queryKey: ['lectures', courseId, sectionId] });
         },
     });
 
-    function moveSection(index: number, direction: 'up' | 'down') {
-        if (!sections) return;
-        const ordered = [...sections].sort((a, b) => a.order - b.order);
+    function moveLecture(index: number, direction: 'up' | 'down') {
+        if (!lectures) return;
+        const ordered = [...lectures].sort((a, b) => a.order - b.order);
         const targetIndex = direction === 'up' ? index - 1 : index + 1;
         if (targetIndex < 0 || targetIndex >= ordered.length) return;
-        const ids = ordered.map((s) => s.section_id);
+        const ids = ordered.map((l) => l.lecture_id);
         [ids[index], ids[targetIndex]] = [ids[targetIndex], ids[index]];
         reorderMutation.mutate(ids);
     }
 
     if (isLoading) return <p className="text-sm text-muted-foreground px-4 py-12">Loading...</p>;
-    if (isError) return <p className="text-sm text-destructive px-4 py-12">Failed to load sections.</p>;
+    if (isError) return <p className="text-sm text-destructive px-4 py-12">Failed to load lectures.</p>;
 
-    const sorted = sections ? [...sections].sort((a, b) => a.order - b.order) : [];
+    const sorted = lectures ? [...lectures].sort((a, b) => a.order - b.order) : [];
 
     return (
         <div className="max-w-2xl mx-auto px-4 py-12">
             <Card>
                 <CardHeader>
-                    <CardTitle>Manage Sections</CardTitle>
+                    <CardTitle>Manage Lectures</CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-4">
                     <Button variant="outline" asChild>
-                        <Link href={`/courses/${courseId}/edit`}>← Back to Course</Link>
+                        <Link href={`/courses/${courseId}/sections`}>← Back to Sections</Link>
                     </Button>
 
                     <Separator />
@@ -124,23 +134,36 @@ export default function SectionsPage() {
                         onSubmit={handleSubmit((data) => addMutation.mutate(data))}
                         className="space-y-2"
                     >
-                        <Label htmlFor="title">Add Section</Label>
-                        <div className="flex gap-2">
-                            <Input
-                                id="title"
-                                placeholder="Section title"
-                                {...register('title')}
-                            />
-                            <Button type="submit" disabled={addMutation.isPending}>
-                                {addMutation.isPending ? 'Adding...' : 'Add'}
-                            </Button>
+                        <Label>Add Lecture</Label>
+                        <div className="space-y-1">
+                            <Input placeholder="Lecture title" {...register('title')} />
+                            {errors.title && (
+                                <p className="text-sm text-destructive">{errors.title.message}</p>
+                            )}
                         </div>
-                        {errors.title && (
-                            <p className="text-sm text-destructive">{errors.title.message}</p>
-                        )}
+                        <div className="space-y-1">
+                            <Label htmlFor="content_type">Content type</Label>
+                            <select
+                                id="content_type"
+                                {...register('content_type')}
+                                className="w-full border border-border rounded px-3 py-2 text-sm bg-background"
+                            >
+                                {CONTENT_TYPES.map((t) => (
+                                    <option key={t} value={t}>
+                                        {t.charAt(0).toUpperCase() + t.slice(1)}
+                                    </option>
+                                ))}
+                            </select>
+                            {errors.content_type && (
+                                <p className="text-sm text-destructive">{errors.content_type.message}</p>
+                            )}
+                        </div>
+                        <Button type="submit" disabled={addMutation.isPending}>
+                            {addMutation.isPending ? 'Adding...' : 'Add Lecture'}
+                        </Button>
                         {addMutation.isError && (
                             <p className="text-sm text-destructive">
-                                {(addMutation.error as any)?.response?.data?.message ?? 'Failed to add section.'}
+                                {(addMutation.error as any)?.response?.data?.message ?? 'Failed to add lecture.'}
                             </p>
                         )}
                     </form>
@@ -148,16 +171,16 @@ export default function SectionsPage() {
                     <Separator />
 
                     {sorted.length === 0 && (
-                        <p className="text-sm text-muted-foreground">No sections yet. Add one above.</p>
+                        <p className="text-sm text-muted-foreground">No lectures yet. Add one above.</p>
                     )}
 
                     <div className="space-y-2">
-                        {sorted.map((section, index) => (
-                            <div key={section.section_id} className="space-y-2">
+                        {sorted.map((lecture, index) => (
+                            <div key={lecture.lecture_id} className="space-y-2">
                                 <div className="flex items-center gap-2">
                                     <span className="text-sm text-muted-foreground w-5">{index + 1}.</span>
 
-                                    {editingId === section.section_id ? (
+                                    {editingId === lecture.lecture_id ? (
                                         <div className="flex gap-2 flex-1">
                                             <Input
                                                 value={editTitle}
@@ -169,7 +192,7 @@ export default function SectionsPage() {
                                                 disabled={renameMutation.isPending}
                                                 onClick={() =>
                                                     renameMutation.mutate({
-                                                        sectionId: section.section_id,
+                                                        lectureId: lecture.lecture_id,
                                                         title: editTitle,
                                                     })
                                                 }
@@ -185,38 +208,41 @@ export default function SectionsPage() {
                                             </Button>
                                         </div>
                                     ) : (
-                                        <span className="flex-1 text-sm">{section.title}</span>
+                                        <span className="flex-1 text-sm">
+                                            {lecture.title}{' '}
+                                            <span className="text-muted-foreground">
+                                                [{lecture.content_type}]
+                                            </span>
+                                        </span>
                                     )}
 
-                                    {editingId !== section.section_id && (
+                                    {editingId !== lecture.lecture_id && (
                                         <div className="flex gap-1">
                                             <Button
                                                 size="sm"
                                                 variant="outline"
                                                 disabled={index === 0 || reorderMutation.isPending}
-                                                onClick={() => moveSection(index, 'up')}
+                                                onClick={() => moveLecture(index, 'up')}
                                             >
                                                 ↑
                                             </Button>
                                             <Button
                                                 size="sm"
                                                 variant="outline"
-                                                disabled={index === sorted.length - 1 || reorderMutation.isPending}
-                                                onClick={() => moveSection(index, 'down')}
+                                                disabled={
+                                                    index === sorted.length - 1 ||
+                                                    reorderMutation.isPending
+                                                }
+                                                onClick={() => moveLecture(index, 'down')}
                                             >
                                                 ↓
-                                            </Button>
-                                            <Button size="sm" variant="outline" asChild>
-                                                <Link href={`/courses/${courseId}/sections/${section.section_id}/lectures`}>
-                                                    Lectures
-                                                </Link>
                                             </Button>
                                             <Button
                                                 size="sm"
                                                 variant="outline"
                                                 onClick={() => {
-                                                    setEditingId(section.section_id);
-                                                    setEditTitle(section.title);
+                                                    setEditingId(lecture.lecture_id);
+                                                    setEditTitle(lecture.title);
                                                     setConfirmDeleteId(null);
                                                 }}
                                             >
@@ -226,7 +252,7 @@ export default function SectionsPage() {
                                                 size="sm"
                                                 variant="destructive"
                                                 onClick={() => {
-                                                    setConfirmDeleteId(section.section_id);
+                                                    setConfirmDeleteId(lecture.lecture_id);
                                                     setEditingId(null);
                                                 }}
                                             >
@@ -236,14 +262,15 @@ export default function SectionsPage() {
                                     )}
                                 </div>
 
-                                {confirmDeleteId === section.section_id && (
+                                {confirmDeleteId === lecture.lecture_id && (
                                     <div className="ml-6 space-y-2">
                                         <p className="text-sm text-destructive">
-                                            Delete &quot;{section.title}&quot;? This cannot be undone.
+                                            Delete &quot;{lecture.title}&quot;? This cannot be undone.
                                         </p>
                                         {deleteMutation.isError && (
                                             <p className="text-sm text-destructive">
-                                                {(deleteMutation.error as any)?.response?.data?.message ?? 'Failed to delete.'}
+                                                {(deleteMutation.error as any)?.response?.data?.message ??
+                                                    'Failed to delete.'}
                                             </p>
                                         )}
                                         <div className="flex gap-2">
@@ -251,7 +278,7 @@ export default function SectionsPage() {
                                                 size="sm"
                                                 variant="destructive"
                                                 disabled={deleteMutation.isPending}
-                                                onClick={() => deleteMutation.mutate(section.section_id)}
+                                                onClick={() => deleteMutation.mutate(lecture.lecture_id)}
                                             >
                                                 {deleteMutation.isPending ? 'Deleting...' : 'Confirm'}
                                             </Button>

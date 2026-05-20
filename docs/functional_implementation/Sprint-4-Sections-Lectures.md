@@ -10,6 +10,7 @@
 ## Table of Contents
 
 1. [US-16 — Section Management](#1-us-16--section-management)
+2. [US-17 — Create Lecture](#2-us-17--create-lecture)
 
 ---
 
@@ -415,4 +416,372 @@ Browser                  NestJS (SectionsController)        PostgreSQL
   |                                 |-- SELECT ORDER BY order --->|
   |                                 |<-- [s2, s1, s3] -----------|
   |<-- 200 [ { section_id, title, order }, ... ] --------------|
+```
+
+---
+
+## 2. US-17 — Create Lecture
+
+> *As an Instructor, I want to create a lecture and choose its content type so that I can deliver content in the appropriate format.*
+
+### Acceptance Criteria
+
+- Instructor selects content type: video, article, or quiz
+- Lecture is linked to the correct section
+- Instructor can reorder lectures within a section
+
+---
+
+### 2.1 Theory — Content Types and the Discriminator Pattern
+
+A lecture is a container. On its own, it only holds metadata: a title, a position in the section, and a **content type**. The actual content (a YouTube video ID, article body text, or quiz questions) lives in a separate child table.
+
+```
+lectures
+  └── content_type = 'video'   → videos table (lecture_id FK, youtube_video_id, …)
+  └── content_type = 'article' → articles table (lecture_id FK, body, reading_time, …)
+  └── content_type = 'quiz'    → quizzes table (lecture_id FK, …)
+```
+
+This is the **discriminator pattern** (sometimes called a polymorphic one-to-one). The `content_type` column tells you which child table to look in. Each child row has a 1:1 FK back to the parent lecture.
+
+Why not store everything in one big `lectures` table with nullable columns? Because that table would quickly become unmanageable — dozens of nullable columns, many of which are irrelevant for 2 out of 3 content types. Separate tables keep each content type clean and independently queryable.
+
+**Sprint 4 scope:** US-17 only creates the lecture shell (title + content type). The child records are created in Sprint 5 (videos, articles) and Sprint 6 (quizzes). This is intentional — you build the scaffold before filling it in.
+
+---
+
+### 2.2 Theory — Enum Columns and TypeORM's `const object` Pattern
+
+The `content_type` column is an `ENUM` in PostgreSQL — the database itself enforces that only `'video'`, `'article'`, or `'quiz'` can be stored. This prevents bad data from ever reaching the application layer.
+
+TypeScript has two ways to model enums. Betazoid uses the **const object** form deliberately:
+
+```typescript
+// ✅ Used in this project — a plain JS object with a union type
+export const LectureContentType = {
+    VIDEO: 'video',
+    ARTICLE: 'article',
+    QUIZ: 'quiz',
+} as const;
+export type LectureContentType = (typeof LectureContentType)[keyof typeof LectureContentType];
+
+// ❌ Not used — TypeScript enum keyword
+enum LectureContentType { VIDEO = 'video', ARTICLE = 'article', QUIZ = 'quiz' }
+```
+
+The reason: TypeScript `enum` objects have quirky runtime behavior and are harder to iterate. With the const object form, `Object.values(LectureContentType)` gives you `['video', 'article', 'quiz']` — the exact array that TypeORM and `class-validator` need for validation.
+
+---
+
+### 2.3 Theory — Ownership Verification Through a Relation Chain
+
+Sections belong to courses. Courses belong to instructors. Lectures belong to sections. So to verify "can this instructor create a lecture in this section?", you must traverse the chain:
+
+```
+Lecture → Section → Course → User (instructor)
+```
+
+The service loads the section with its course and the course's instructor in one query using TypeORM's `relations` option:
+
+```typescript
+const section = await this.sectionRepo.findOne({
+    where: { section_id: sectionId, course: { course_id: courseId } },
+    relations: ['course', 'course.instructor'],
+});
+```
+
+This is a single SQL join query. After loading, the check is simple:
+
+```typescript
+if (section.course.instructor.user_id !== instructorId) throw new ForbiddenException(...)
+```
+
+The same check also blocks edits when the course is in `PENDING` status — an instructor cannot edit a course that is under admin review (inherited from the same rule established in US-16).
+
+---
+
+### 2.4 Backend — Lectures Module
+
+#### Endpoint table
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/courses/:courseId/sections/:sectionId/lectures` | JWT | Create a lecture |
+| `GET` | `/courses/:courseId/sections/:sectionId/lectures` | JWT | List lectures for a section |
+| `PATCH` | `/courses/:courseId/sections/:sectionId/lectures/:lectureId` | JWT | Update title or content type |
+| `DELETE` | `/courses/:courseId/sections/:sectionId/lectures/:lectureId` | JWT | Delete a lecture |
+| `POST` | `/courses/:courseId/sections/:sectionId/lectures/reorder` | JWT | Reorder lectures |
+
+All routes are nested under the section, which is itself nested under the course. This makes the URL self-documenting: every segment narrows the scope.
+
+#### Entity — `lecture.entity.ts`
+
+```typescript
+export const LectureContentType = {
+    VIDEO: 'video',
+    ARTICLE: 'article',
+    QUIZ: 'quiz',
+} as const;
+export type LectureContentType = (typeof LectureContentType)[keyof typeof LectureContentType];
+
+@Entity('lectures')
+export class Lecture {
+    @PrimaryGeneratedColumn('uuid')
+    lecture_id!: string;
+
+    @Column({ length: 200 })
+    title!: string;
+
+    @Column({ type: 'enum', enum: Object.values(LectureContentType) })
+    content_type!: LectureContentType;           // ← the discriminator
+
+    @Column({ type: 'int', default: 0 })
+    order!: number;                              // ← position within the section
+
+    @ManyToOne(() => Section, { onDelete: 'CASCADE' })
+    @JoinColumn({ name: 'section_id' })
+    section!: Section;                           // ← FK to parent section
+
+    @CreateDateColumn() created_at!: Date;
+    @UpdateDateColumn() updated_at!: Date;
+}
+```
+
+Key points:
+- `onDelete: 'CASCADE'` — when a section is deleted, all its lectures are automatically deleted by the database. No application code needed.
+- `order` starts at 0 and is set to the current lecture count at creation time (same append-at-end pattern as sections).
+
+#### DTOs
+
+**`create-lecture.dto.ts`** — both fields required on POST:
+
+```typescript
+export class CreateLectureDto {
+    @IsString()
+    @MinLength(1)
+    @MaxLength(200)
+    title!: string;
+
+    @IsEnum(Object.values(LectureContentType))   // ← validates against ['video','article','quiz']
+    content_type!: LectureContentType;
+}
+```
+
+**`update-lecture.dto.ts`** — all fields optional on PATCH:
+
+```typescript
+export class UpdateLectureDto {
+    @IsOptional() @IsString() @MinLength(1) @MaxLength(200)
+    title?: string;
+
+    @IsOptional() @IsEnum(Object.values(LectureContentType))
+    content_type?: LectureContentType;
+}
+```
+
+**`reorder-lectures.dto.ts`** — same shape as the sections reorder DTO:
+
+```typescript
+export class ReorderLecturesDto {
+    @IsArray()
+    @IsUUID(undefined, { each: true })
+    orderedIds!: string[];
+}
+```
+
+#### Service — key methods
+
+**`create`** — appends a new lecture at the end:
+
+```typescript
+async create(courseId, sectionId, dto, instructorId): Promise<Lecture> {
+    const section = await this.verifySectionOwnership(courseId, sectionId, instructorId);
+
+    const count = await this.lectureRepo.count({
+        where: { section: { section_id: sectionId } },
+    });
+    // count = 0 → first lecture gets order=0; count = 3 → fourth gets order=3
+
+    const lecture = this.lectureRepo.create({
+        title: dto.title,
+        content_type: dto.content_type,
+        order: count,         // append at end
+        section,
+    });
+    return this.lectureRepo.save(lecture);
+}
+```
+
+**`reorder`** — the same transactional batch-update pattern used for sections:
+
+```typescript
+async reorder(courseId, sectionId, dto, instructorId): Promise<Lecture[]> {
+    await this.verifySectionOwnership(courseId, sectionId, instructorId);
+
+    const lectures = await this.lectureRepo.find({ where: { section: { section_id: sectionId } } });
+
+    // Guard: orderedIds must be a complete set (not a subset)
+    if (dto.orderedIds.length !== lectures.length) throw new BadRequestException(...)
+
+    const lectureMap = new Map(lectures.map(l => [l.lecture_id, l]));
+
+    // Guard: every ID must belong to this section (no foreign IDs injected)
+    for (const id of dto.orderedIds) {
+        if (!lectureMap.has(id)) throw new BadRequestException(...)
+    }
+
+    await this.dataSource.transaction(async (manager) => {
+        for (let i = 0; i < dto.orderedIds.length; i++) {
+            const lecture = lectureMap.get(dto.orderedIds[i])!;
+            lecture.order = i;
+            await manager.save(Lecture, lecture);
+        }
+    });
+
+    return this.lectureRepo.find({ where: { ... }, order: { order: 'ASC' } });
+}
+```
+
+The transaction wraps all individual `UPDATE` statements. If any one fails (disk full, connection lost), PostgreSQL rolls back the entire batch — you never end up with a partial reorder.
+
+---
+
+### 2.5 Frontend — Lectures Page
+
+**Route:** `/courses/[id]/sections/[sectionId]/lectures`
+
+The page lives at `frontend/src/app/courses/[id]/sections/[sectionId]/lectures/page.tsx` and mirrors the sections page structure exactly.
+
+#### Navigation entry point
+
+A **Lectures** button was added to each section row on the sections page (`/courses/[id]/sections`):
+
+```tsx
+<Button size="sm" variant="outline" asChild>
+    <Link href={`/courses/${courseId}/sections/${section.section_id}/lectures`}>
+        Lectures
+    </Link>
+</Button>
+```
+
+This uses the `asChild` pattern — the `Button` renders as a `<Link>` while keeping all button styles. No raw `className` manipulation needed.
+
+#### Data fetching
+
+```tsx
+const { data: lectures } = useQuery<Lecture[]>({
+    queryKey: ['lectures', courseId, sectionId],
+    queryFn: async () => {
+        const { data } = await api.get(
+            `/courses/${courseId}/sections/${sectionId}/lectures`
+        );
+        return data;
+    },
+    enabled: !!accessToken && !!courseId && !!sectionId,  // ← all three must be truthy
+});
+```
+
+The `queryKey` includes both `courseId` and `sectionId` so that TanStack Query caches each section's lectures independently. If you navigate between two sections for the same course, their lecture lists don't collide.
+
+#### Create form
+
+```tsx
+const addLectureSchema = z.object({
+    title: z.string().min(1, 'Title is required').max(200),
+    content_type: z.enum(CONTENT_TYPES),   // mirrors the backend enum
+});
+```
+
+The content type is a `<select>` element (not a shadcn component — no `Select` has been installed yet). It is styled with design-token classes only:
+
+```tsx
+<select
+    {...register('content_type')}
+    className="w-full border border-border rounded px-3 py-2 text-sm bg-background"
+>
+    {CONTENT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+</select>
+```
+
+The `defaultValues` in `useForm` pre-select `'video'` so the user sees a valid choice immediately. After a successful submit, `reset({ content_type: 'video' })` clears the title but preserves the default content type.
+
+#### Reorder
+
+Up/Down buttons call the same move-and-swap helper used on the sections page:
+
+```tsx
+function moveLecture(index: number, direction: 'up' | 'down') {
+    if (!lectures) return;
+    const ordered = [...lectures].sort((a, b) => a.order - b.order);
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= ordered.length) return;
+    const ids = ordered.map(l => l.lecture_id);
+    [ids[index], ids[targetIndex]] = [ids[targetIndex], ids[index]]; // swap
+    reorderMutation.mutate(ids);
+}
+```
+
+The sorted array is derived from the query cache on each render — the `order` field is the source of truth from the server. When `reorderMutation` succeeds, `invalidateQueries` refetches the list and re-sorts it.
+
+---
+
+### 2.6 Security / Design Notes
+
+**Content type is final (by design for Sprint 4):** The update DTO allows changing `content_type`, but in practice this should be disallowed once a child record (video/article/quiz) has been attached in Sprint 5/6. For now, the constraint is not enforced — no child records exist yet.
+
+**CASCADE delete:** Deleting a section deletes all its lectures (PostgreSQL `ON DELETE CASCADE`). This is intentional and documented — instructors are warned in the UI before confirming a section delete.
+
+**Reorder validation:** Two guards prevent injection attacks on the reorder endpoint:
+1. The ID count must match exactly — you cannot submit a partial list to leave some lectures with stale order values.
+2. Every ID must belong to the target section — an attacker cannot inject a foreign `lecture_id` to corrupt another section's ordering.
+
+---
+
+### 2.7 The Full Flow
+
+**Create a lecture:**
+
+```
+Browser                  NestJS (LecturesController)          PostgreSQL
+  |                                 |                               |
+  |-- POST /courses/:c/sections/:s/lectures                         |
+  |   { title, content_type }       |                               |
+  |                           JwtAuthGuard validates token          |
+  |                                 |                               |
+  |                           verifySectionOwnership()              |
+  |                                 |-- SELECT section + course  -->|
+  |                                 |   WHERE section_id = :s       |
+  |                                 |   AND course_id = :c          |
+  |                                 |<-- { section, course, instr} -|
+  |                           check instructor_id + status          |
+  |                                 |                               |
+  |                                 |-- COUNT lectures WHERE s_id ->|
+  |                                 |<-- 2 (next order = 2) --------|
+  |                                 |                               |
+  |                                 |-- INSERT INTO lectures ------->|
+  |                                 |   (title, content_type,       |
+  |                                 |    order=2, section_id)        |
+  |                                 |<-- { lecture_id, … } ---------|
+  |<-- 201 { lecture_id, title, content_type, order } ------------|
+```
+
+**Reorder lectures:**
+
+```
+Browser                  NestJS (LecturesController)          PostgreSQL
+  |                                 |                               |
+  |-- POST …/lectures/reorder       |                               |
+  |   { orderedIds: [b, a, c] }     |                               |
+  |                           verify ownership + validate IDs       |
+  |                                 |-- SELECT all lectures -------->|
+  |                                 |<-- [a(0), b(1), c(2)] --------|
+  |                            BEGIN TRANSACTION                    |
+  |                                 |-- UPDATE b SET order=0 ------->|
+  |                                 |-- UPDATE a SET order=1 ------->|
+  |                                 |-- UPDATE c SET order=2 ------->|
+  |                            COMMIT                               |
+  |                                 |-- SELECT ORDER BY order ------>|
+  |                                 |<-- [b, a, c] -----------------|
+  |<-- 200 [ { lecture_id, title, content_type, order }, … ] -----|
 ```
