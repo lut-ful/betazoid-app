@@ -6,6 +6,7 @@ import { User } from '../users/entities/user.entity';
 import { AssignPermissionsDto } from './dto/assign-permissions.dto';
 import { AssignRolesDto } from './dto/assign-roles.dto';
 import { CreateRoleDto } from './dto/create-role.dto';
+import { UpdateRoleDto } from './dto/update-role.dto';
 import { Role } from './entities/role.entity';
 import { UserRole } from './entities/user-role.entity';
 
@@ -34,7 +35,34 @@ export class RolesService {
     }
 
     async findAll(): Promise<Role[]> {
-        return this.roleRepo.find({ order: { created_at: 'ASC' } });
+        return this.roleRepo
+            .createQueryBuilder('role')
+            .loadRelationCountAndMap('role.userCount', 'role.userRoles')
+            .orderBy('role.created_at', 'ASC')
+            .getMany();
+    }
+
+    async update(roleId: string, dto: UpdateRoleDto): Promise<Role> {
+        const role = await this.roleRepo.findOne({ where: { role_id: roleId } });
+        if (!role) throw new NotFoundException('Role not found');
+
+        if (dto.name && dto.name !== role.name) {
+            const conflict = await this.roleRepo.findOne({ where: { name: dto.name } });
+            if (conflict) throw new ConflictException('A role with this name already exists');
+            role.name = dto.name;
+        }
+
+        if (dto.description !== undefined) {
+            role.description = dto.description ?? null;
+        }
+
+        return this.roleRepo.save(role);
+    }
+
+    async remove(roleId: string): Promise<void> {
+        const role = await this.roleRepo.findOne({ where: { role_id: roleId } });
+        if (!role) throw new NotFoundException('Role not found');
+        await this.roleRepo.remove(role);
     }
 
     async findRoleWithPermissions(roleId: string): Promise<Role> {

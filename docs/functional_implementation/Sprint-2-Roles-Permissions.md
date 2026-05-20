@@ -12,6 +12,7 @@
 1. [US-06 — Create Role](#1-us-06--create-role)
 2. [US-07 — Assign Permissions to Role](#2-us-07--assign-permissions-to-role)
 3. [US-08 — Assign Role to User](#3-us-08--assign-role-to-user)
+4. [US-09 — Edit or Delete Role](#4-us-09--edit-or-delete-role)
 
 ---
 
@@ -1449,4 +1450,526 @@ Browser (/admin/users)           NestJS                          PostgreSQL
          │                          │   AND role.name = 'Super Admin' │
          │                          │◄─ row found (just inserted) ────│
          │◄── 200 (access granted) ──│                                 │
+```
+
+---
+
+## 4. US-09 — Edit or Delete Role
+
+> *As a Super Admin, I want to edit or delete a role so that I can keep the role structure up to date.*
+
+### Acceptance Criteria
+- Role name and description can be updated
+- Deleting a role removes all associated user_role and role_permission records
+- System warns before deletion if the role is currently assigned to users
+
+---
+
+### 4.1 Theory — Cascading deletes and partial updates
+
+#### What happens when you delete a role?
+
+A `Role` row in the database is not isolated. It is referenced by two other tables:
+
+```
+roles
++----------+
+| role_id  |<──── user_roles.role_id      (which users hold this role)
+| name     |<──── role_permissions.role_id (which permissions this role has)
++----------+
+```
+
+If you issue `DELETE FROM roles WHERE role_id = X` without handling these references, PostgreSQL will raise a **foreign key violation** error and refuse to delete the row. The row cannot be removed while other rows in other tables still point to it.
+
+There are three standard strategies for handling this:
+
+| Strategy | Behaviour | When to use |
+|---|---|---|
+| `RESTRICT` (default) | Reject the DELETE if any referencing rows exist | When child records should always outlive the parent |
+| `SET NULL` | Set the FK column to NULL in referencing rows | When the child can exist independently without a parent |
+| `CASCADE` | Automatically delete all referencing rows first | When the child record has no meaning without the parent |
+
+For `user_roles`: a role assignment row has no meaning without a role. If the "Moderator" role is deleted, every `user_roles` row pointing to it must be deleted too. **CASCADE is correct.**
+
+For `role_permissions`: this is a join table managed by TypeORM (from the `@ManyToMany` + `@JoinTable` on `Role`). TypeORM handles this table's lifecycle automatically — when you delete a `Role` entity via `roleRepo.remove(role)`, TypeORM clears the join table rows for that role before issuing the `DELETE` on the `roles` row.
+
+```
+roleRepo.remove(role)
+    │
+    ├─ TypeORM: DELETE FROM role_permissions WHERE role_id = X
+    │   (join table rows cleared by TypeORM before the entity is deleted)
+    │
+    └─ PostgreSQL: DELETE FROM roles WHERE role_id = X
+        │
+        └─ DB CASCADE: DELETE FROM user_roles WHERE role_id = X
+           (triggered automatically by the FK constraint)
+```
+
+Everything is cleaned up in one call — no manual cleanup queries needed.
+
+#### Why warn before deleting a role that has users?
+
+Deleting a role with active users is irreversible and has an immediate security impact: those users lose all access granted by that role on their very next request. The system does not prevent the deletion (the Super Admin has authority to do it), but the UI must surface the impact before the admin confirms.
+
+The warning flow is:
+
+```
+Admin clicks "Delete"
+      │
+      ▼
+Does role.userCount > 0?
+      │
+      ├── Yes → Show warning: "X users will lose access"
+      │          Show "Are you sure?" text
+      │          Show "Confirm" button
+      │
+      └── No  → Show only "Are you sure?" text
+                 Show "Confirm" button
+```
+
+The `userCount` is embedded in the roles list response (not a separate API call), so no additional round-trip is needed when the admin clicks Delete.
+
+#### What is a partial update (PATCH)?
+
+HTTP has two verbs for updating resources:
+
+| Verb | Semantics | Example body |
+|---|---|---|
+| `PUT` | Replace the entire resource | `{ "name": "...", "description": "..." }` — all fields required |
+| `PATCH` | Update only the supplied fields | `{ "name": "..." }` — description unchanged if omitted |
+
+US-09 uses `PATCH` because the admin should be able to change just the name without affecting the description (and vice versa). A `PUT` would require sending both fields every time, even when only one changed.
+
+The backend DTO marks both fields `@IsOptional()`. The service only applies changes for the fields that are actually present in the request body.
+
+---
+
+### 4.2 Backend — Updating and deleting roles
+
+#### Endpoints
+
+```
+PATCH /api/v1/roles/:id
+Headers: Authorization: Bearer <token>  (Super Admin only)
+Body:   { "name": "Senior Moderator" }        ← only changed fields needed
+        { "description": "Updated desc" }     ← name unchanged if omitted
+        { "name": "X", "description": "Y" }   ← both fields at once
+
+Response 200: { role_id, name, description, created_at, updated_at }
+Response 404: role not found
+Response 409: new name already belongs to another role
+Response 400: :id is not a valid UUID
+
+---
+
+DELETE /api/v1/roles/:id
+Headers: Authorization: Bearer <token>  (Super Admin only)
+
+Response 204: No Content  (success — nothing to return, the resource is gone)
+Response 404: role not found
+Response 400: :id is not a valid UUID
+```
+
+#### The DTO — `roles/dto/update-role.dto.ts`
+
+```typescript
+export class UpdateRoleDto {
+    @IsOptional()
+    // The field may be entirely absent from the request body.
+    // If absent, the service leaves the existing value unchanged.
+    @IsString()
+    @IsNotEmpty()
+    // IsNotEmpty prevents sending { "name": "" } to wipe the name.
+    // A role must always have a non-empty name.
+    @MaxLength(100)
+    // Mirrors the DB column length — same constraint, applied at the DTO layer
+    // before the data reaches the DB.
+    name?: string;
+
+    @IsOptional()
+    @IsString()
+    description?: string;
+    // No @IsNotEmpty here — sending { "description": "" } is valid.
+    // An empty string will be stored as "" (not null). Sending null or
+    // omitting the field entirely are two different actions:
+    //   omit → don't change the existing description
+    //   "" → clear the description to an empty string
+}
+```
+
+Why does `name` have `@IsNotEmpty` but `description` does not? A role's name is its identifier — blanking it would make the role unrecognisable in the UI. A description is purely informational and can legitimately be empty.
+
+#### Updated `findAll()` — adding userCount to the response
+
+```typescript
+async findAll(): Promise<Role[]> {
+    return this.roleRepo
+        .createQueryBuilder('role')
+        .loadRelationCountAndMap('role.userCount', 'role.userRoles')
+        // loadRelationCountAndMap: maps a COUNT of a relation into a virtual property.
+        // First arg: 'role.userCount' — the property name to attach to each Role object.
+        // Second arg: 'role.userRoles' — the relation to count.
+        //
+        // SQL equivalent:
+        //   SELECT role.*, (SELECT COUNT(*) FROM user_roles ur WHERE ur.role_id = role.role_id)
+        //   AS "userCount"
+        //   FROM roles role
+        //
+        // The Role entity does not have a userCount column — TypeORM adds this
+        // property dynamically to the returned objects at runtime.
+        .orderBy('role.created_at', 'ASC')
+        .getMany();
+}
+```
+
+Why use `createQueryBuilder` here instead of `find()`? TypeORM's `find()` does not support `loadRelationCountAndMap` — that method is exclusive to the QueryBuilder API. The alternative would be to load all `userRoles` relations (fetching full row data for every assignment) just to count them, which wastes memory proportional to the number of assignments on the platform.
+
+#### The service — `update()` method
+
+```typescript
+async update(roleId: string, dto: UpdateRoleDto): Promise<Role> {
+    const role = await this.roleRepo.findOne({ where: { role_id: roleId } });
+    if (!role) throw new NotFoundException('Role not found');
+    // Confirm the role exists before attempting any update.
+
+    if (dto.name && dto.name !== role.name) {
+        // Only check name uniqueness if a new name was actually provided
+        // AND it is different from the current name.
+        // If the admin submits { name: "Moderator" } and the role is already
+        // named "Moderator", skip the uniqueness check — it is not a conflict.
+        const conflict = await this.roleRepo.findOne({ where: { name: dto.name } });
+        if (conflict) throw new ConflictException('A role with this name already exists');
+    }
+
+    if (dto.name) {
+        role.name = dto.name;
+    }
+
+    if (dto.description !== undefined) {
+        // dto.description !== undefined means the field was present in the body.
+        // We allow "" (empty string) and store it.
+        // We cannot use ?? null here because the TypeScript type is string | undefined
+        // and the DB column is string | null — if description was not sent,
+        // undefined means "leave the existing value alone".
+        role.description = dto.description ?? null;
+    }
+
+    return this.roleRepo.save(role);
+    // save() on an existing entity issues an UPDATE, not an INSERT.
+    // TypeORM compares the entity's primary key to determine INSERT vs UPDATE.
+    // updated_at is refreshed automatically by @UpdateDateColumn.
+}
+```
+
+#### The service — `remove()` method
+
+```typescript
+async remove(roleId: string): Promise<void> {
+    const role = await this.roleRepo.findOne({ where: { role_id: roleId } });
+    if (!role) throw new NotFoundException('Role not found');
+    // Confirm the role exists before deleting.
+    // Without this check, deleting a non-existent ID would silently succeed
+    // (no rows affected), which would give the frontend a misleading 204 response.
+
+    await this.roleRepo.remove(role);
+    // remove() deletes the entity by its primary key.
+    //
+    // Why remove() instead of delete()?
+    //   roleRepo.delete({ role_id: roleId }) issues a raw DELETE SQL.
+    //   roleRepo.remove(role) works through the entity instance — TypeORM
+    //   processes relation lifecycles (including clearing the role_permissions
+    //   join table managed by @ManyToMany + @JoinTable) before issuing the DELETE.
+    //
+    // The user_roles cleanup is handled by the DB-level CASCADE constraint
+    // on user_roles.role_id — TypeORM does not need to touch that table manually.
+}
+```
+
+#### Updated controller — `roles/roles.controller.ts`
+
+```typescript
+@Patch(':id')
+@HttpCode(HttpStatus.OK)
+update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateRoleDto) {
+    // ParseUUIDPipe rejects non-UUID values before the service runs.
+    // PATCH :id is placed BEFORE Put('users/:userId/roles') in the file —
+    // NestJS resolves routes in declaration order; both use a `:param` segment
+    // so ordering matters to avoid ambiguity.
+    return this.rolesService.update(id, dto);
+}
+
+@Delete(':id')
+@HttpCode(HttpStatus.NO_CONTENT)
+// 204 No Content is the correct status for a successful DELETE.
+// There is no resource to return — the entity has been destroyed.
+// Returning 200 with an empty body would also be acceptable but 204 is
+// the HTTP standard for "success, nothing to return".
+remove(@Param('id', ParseUUIDPipe) id: string) {
+    return this.rolesService.remove(id);
+}
+```
+
+**Route ordering note:** Both `PATCH :id` and `Delete :id` use a single `:id` parameter segment. They are placed *before* `@Put('users/:userId/roles')` in the controller. NestJS resolves parameterised routes in declaration order — declaring them early prevents `users` in `PUT /roles/users/:userId/roles` from accidentally matching the `:id` parameter.
+
+---
+
+### 4.3 Frontend — Inline edit and two-step delete
+
+The updated `/admin/roles` page introduces two new interactive behaviours per role row:
+
+1. **Inline edit** — clicking "Edit" replaces the role display with a pre-filled form
+2. **Two-step delete** — clicking "Delete" reveals a confirmation area (with a warning if users are assigned)
+
+#### State for editing
+
+```typescript
+const [editingId, setEditingId] = useState<string | null>(null);
+// Tracks which role (if any) is currently showing its edit form.
+// null means no role is being edited.
+// Only one role can be in edit mode at a time — opening a second would
+// close the first (the same setEditingId call handles both).
+```
+
+#### The `EditRoleForm` component
+
+```typescript
+function EditRoleForm({ role, onDone }: { role: Role; onDone: () => void }) {
+    const queryClient = useQueryClient();
+
+    const { register, handleSubmit, formState: { errors } } = useForm<RoleFormData>({
+        resolver: zodResolver(roleSchema),
+        defaultValues: { name: role.name, description: role.description ?? '' },
+        // defaultValues pre-fills the form with the role's current values.
+        // Without this, the inputs would start empty — the admin would have to
+        // retype the entire name just to change the description.
+    });
+
+    const mutation = useMutation({
+        mutationFn: (data: RoleFormData) => api.patch(`/roles/${role.role_id}`, data),
+        // PATCH — only sends the fields the admin changed.
+        // react-hook-form collects all declared fields, so both name and description
+        // are always sent. The backend service only applies changes for fields
+        // that differ from the current DB values.
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['roles'] });
+            // Refresh the roles list to show the updated name/description.
+            onDone();
+            // Collapse the edit form back to the read-only view.
+        },
+    });
+
+    return (
+        <form onSubmit={handleSubmit((data) => mutation.mutate(data))} className="space-y-2 mt-2">
+            {/* name input, description textarea, error/cancel buttons */}
+        </form>
+    );
+}
+```
+
+The component is extracted into its own function rather than inlined in the list because it needs its own `useForm` instance. Each role being edited has its own independent form state — extracting the component ensures `useForm` is called per role, not shared across the list.
+
+#### The `DeleteRoleButton` component
+
+```typescript
+function DeleteRoleButton({ role }: { role: Role }) {
+    const [confirmDelete, setConfirmDelete] = useState(false);
+    // Two-step pattern from the frontend conventions:
+    // Step 1 — first click sets confirmDelete = true (reveals confirmation UI)
+    // Step 2 — second click fires the mutation (irreversible action)
+
+    const mutation = useMutation({
+        mutationFn: () => api.delete(`/roles/${role.role_id}`),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['roles'] });
+            // The deleted role disappears from the list immediately.
+        },
+    });
+
+    if (!confirmDelete) {
+        return (
+            <Button variant="destructive" size="sm" onClick={() => setConfirmDelete(true)}>
+                Delete
+            </Button>
+        );
+    }
+
+    return (
+        <div className="space-y-2 mt-2">
+            {role.userCount > 0 && (
+                <p className="text-sm text-destructive">
+                    Warning: this role is assigned to {role.userCount} user
+                    {role.userCount > 1 ? 's' : ''}. Deleting it will remove their access.
+                </p>
+            )}
+            {/* The warning only renders when userCount > 0 — it is not shown
+                for roles that have no users assigned, keeping the UI clean. */}
+            <p className="text-sm text-destructive">Are you sure? This cannot be undone.</p>
+            <div className="flex gap-2">
+                <Button variant="destructive" size="sm"
+                    disabled={mutation.isPending}
+                    onClick={() => mutation.mutate()}>
+                    {mutation.isPending ? 'Deleting...' : 'Confirm'}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setConfirmDelete(false)}>
+                    Cancel
+                </Button>
+            </div>
+        </div>
+    );
+}
+```
+
+Why is `DeleteRoleButton` a separate component rather than inline state in the list? Because each role needs its own `confirmDelete` boolean. If this state lived in the page component, you would need a `Record<string, boolean>` keyed by `role_id`. Extracting the component lets React manage separate state instances naturally — one per list item.
+
+#### The user count display
+
+```typescript
+// Inside the role list item:
+<span className="text-xs text-muted-foreground">
+    {role.userCount} user{role.userCount !== 1 ? 's' : ''} assigned
+</span>
+```
+
+`role.userCount` comes directly from the `GET /roles` response — no extra API call. The backend's `loadRelationCountAndMap` attaches it to every role object in the list. This makes the warning instant (no loading state needed when the admin clicks Delete).
+
+#### Edit vs Delete mutual exclusion
+
+```typescript
+{roles.map((role) => (
+    <li key={role.role_id}>
+        {editingId === role.role_id ? (
+            <EditRoleForm role={role} onDone={() => setEditingId(null)} />
+        ) : (
+            <>
+                {/* read-only display + Edit button */}
+                <DeleteRoleButton role={role} />
+            </>
+        )}
+        {/* When the edit form is open, the Delete button is hidden.
+            This prevents the admin from triggering a delete while also
+            editing — the actions are mutually exclusive for the same role. */}
+    </li>
+))}
+```
+
+---
+
+### 4.4 Security / Design Notes
+
+**Why `roleRepo.remove(role)` instead of `roleRepo.delete({ role_id: id })`?**
+
+TypeORM's `delete()` method issues a raw `DELETE` SQL statement without going through entity lifecycle hooks or relation management. For the `role_permissions` join table (managed by `@ManyToMany` + `@JoinTable`), TypeORM needs to see the entity instance to know which join table rows to clean up first. Using `remove(entity)` ensures TypeORM handles the join table; using `delete()` might leave orphaned rows in `role_permissions` depending on whether the DB has a FK constraint on that table.
+
+The `user_roles` cleanup is handled independently by the PostgreSQL-level `ON DELETE CASCADE` constraint on `user_roles.role_id`. That runs regardless of which TypeORM method deleted the role.
+
+**Uniqueness check in `update()` is application-level, not a transaction**
+
+The update method does:
+1. Fetch the role
+2. Check name uniqueness (if name changed)
+3. Save the role
+
+If two requests race to rename different roles to the same name, both might pass step 2 before either completes step 3. The DB's `UNIQUE` constraint on `roles.name` will then reject the second `UPDATE` with a constraint violation. NestJS will propagate this as a `500 Internal Server Error` rather than a clean `409 Conflict`.
+
+This is an accepted limitation for Sprint 2 — the probability of two Super Admins renaming roles simultaneously is negligible, and the DB constraint prevents data corruption either way. A proper fix would wrap the check-and-save in a `dataSource.transaction()` with a `SELECT ... FOR UPDATE` lock.
+
+**204 No Content vs 200 on DELETE**
+
+`DELETE /roles/:id` returns `204 No Content`. The frontend's `api.delete()` call receives a response with no body — this is expected and correct. TanStack Query's `useMutation` calls `onSuccess` regardless of whether the response body is empty. Do not attempt to parse `response.data` on a 204 response.
+
+**Deleting the Super Admin role**
+
+There is no guard preventing the deletion of the `Super Admin` role itself. A Super Admin could delete the only role that grants Super Admin access, locking everyone out of the admin endpoints. This is acceptable for Sprint 2 — the same guard applies (only a Super Admin can delete roles), and recovery requires a direct DB seed. A production hardening measure would be to check `role.name === 'Super Admin'` in the service and throw a `ForbiddenException`.
+
+---
+
+### 4.5 The full flow
+
+```
+Browser (/admin/roles)        NestJS                        PostgreSQL
+         │                       │                               │
+         │── GET /roles ─────────►│                               │
+         │   Bearer: <token>      │   (guards run as in US-06)   │
+         │                       │                               │
+         │                  RolesService.findAll()               │
+         │                  (QueryBuilder with loadRelationCountAndMap)
+         │                       │── SELECT roles.*,            │
+         │                       │   COUNT(user_roles) AS       │
+         │                       │   userCount                  │
+         │                       │   FROM roles                 │
+         │                       │   LEFT JOIN user_roles ──────►│
+         │                       │   GROUP BY roles.role_id     │
+         │                       │   ORDER BY created_at ASC    │
+         │                       │◄─ [ { ...role, userCount } ] ─│
+         │◄── 200 [ roles ] ──────│                               │
+         │                        │                               │
+    roles list renders with      │                               │
+    userCount and Edit/Delete     │                               │
+    buttons per role              │                               │
+         │                        │                               │
+    Admin clicks "Edit" on        │                               │
+    "Moderator" role              │                               │
+    → editingId = role_id         │                               │
+    → EditRoleForm renders        │                               │
+      pre-filled with             │                               │
+      name="Moderator"            │                               │
+         │                        │                               │
+    Admin changes name to         │                               │
+    "Senior Moderator"            │                               │
+    → clicks "Save"               │                               │
+         │                        │                               │
+         │── PATCH /roles/:id ────►│                               │
+         │   { name: "Senior      │   (guards run)               │
+         │     Moderator" }       │                               │
+         │                   RolesService.update()               │
+         │                       │── SELECT roles WHERE          │
+         │                       │   role_id = :id ──────────────►│
+         │                       │◄─ role found ─────────────────│
+         │                       │── SELECT roles WHERE          │
+         │                       │   name = 'Senior Moderator' ──►│
+         │                       │◄─ null (no conflict) ─────────│
+         │                       │── UPDATE roles SET            │
+         │                       │   name = 'Senior Moderator',  │
+         │                       │   updated_at = now()          │
+         │                       │   WHERE role_id = :id ────────►│
+         │                       │◄─ updated role ───────────────│
+         │◄── 200 { role } ───────│                               │
+         │                        │                               │
+    TanStack Query invalidates    │                               │
+    ['roles'] — list re-fetches   │                               │
+    editingId reset to null       │                               │
+    role shows new name           │                               │
+         │                        │                               │
+    Admin clicks "Delete" on      │                               │
+    "Junior Mod" (3 users)        │                               │
+    → confirmDelete = true        │                               │
+    → warning: "3 users assigned" │                               │
+    → "Are you sure?" visible     │                               │
+         │                        │                               │
+    Admin clicks "Confirm"        │                               │
+         │                        │                               │
+         │── DELETE /roles/:id ───►│                               │
+         │   Bearer: <token>       │   (guards run)               │
+         │                   RolesService.remove()               │
+         │                       │── SELECT roles WHERE          │
+         │                       │   role_id = :id ──────────────►│
+         │                       │◄─ role found ─────────────────│
+         │                       │                               │
+         │                   roleRepo.remove(role)               │
+         │                       │── DELETE FROM role_permissions│
+         │                       │   WHERE role_id = :id ────────►│  ← TypeORM clears join table
+         │                       │── DELETE FROM roles           │
+         │                       │   WHERE role_id = :id ────────►│
+         │                       │◄─ deleted ────────────────────│
+         │                       │                               │  ← PostgreSQL CASCADE fires:
+         │                       │                               │  DELETE FROM user_roles
+         │                       │                               │  WHERE role_id = :id
+         │◄── 204 No Content ─────│                               │
+         │                        │                               │
+    TanStack Query invalidates    │                               │
+    ['roles'] — deleted role      │                               │
+    disappears from the list      │                               │
+    The 3 users who held this     │                               │
+    role lose it on their next    │                               │
+    request (user_roles gone)     │                               │
 ```
