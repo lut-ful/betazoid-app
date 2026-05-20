@@ -1,7 +1,10 @@
+import { ConfigService } from '@nestjs/config';
 import { LoginDto } from './dto/login.dto';
 import {
+    BadRequestException,
     ConflictException,
     Injectable,
+    Logger,
     UnauthorizedException,
 } from '@nestjs/common';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
@@ -13,15 +16,19 @@ import { RegisterDto } from './dto/register.dto';
 import { JwtService } from '@nestjs/jwt';
 import * as crypto from 'crypto';
 
+
 @Injectable()
 export class AuthService {
+    private readonly logger = new Logger(AuthService.name);
+
     constructor(
         @InjectRepository(User)
         private userRepository: Repository<User>,
         @InjectDataSource()
         private dataSource: DataSource,
         private mailService: MailService,
-        private jwtService: JwtService
+        private jwtService: JwtService,
+        private config: ConfigService
     ) { }
 
     async register(dto: RegisterDto): Promise<{ message: string }> {
@@ -104,13 +111,68 @@ export class AuthService {
 
         return this.generateTokens(user);
     }
-    
+
     async logout(userId: string): Promise<{ message: string }> {
         await this.userRepository.update(userId, {
             refresh_token_hash: null,
             refresh_token_expires_at: null,
         });
         return { message: 'Logged out successfully' };
+    }
+    async forgotPassword(email: string): Promise<{ message: string }> {
+        const safeMessage = 'If that email is registered, a reset link has been sent.';
+
+        const user = await this.userRepository.findOne({ where: { email } });
+        this.logger.log(`forgotPassword: user found=${!!user} email=${email}`);
+        if (!user) {
+            return { message: safeMessage };
+        }
+
+        const rawToken = crypto.randomUUID();
+        const tokenHash = this.hashToken(rawToken);
+
+        const expiresAt = new Date();
+        expiresAt.setMinutes(expiresAt.getMinutes() + 30);
+
+        await this.userRepository.update(user.user_id, {
+            reset_password_token: tokenHash,
+            reset_password_expires_at: expiresAt,
+        });
+
+        const appUrl = this.config.get<string>('APP_URL');
+        const resetUrl = `${appUrl}/reset-password?token=${rawToken}`;
+        this.logger.log(`forgotPassword: reset URL generated for ${email}`);
+
+        try {
+            await this.mailService.sendPasswordResetEmail(user.email, user.full_name, resetUrl);
+            this.logger.log(`forgotPassword: email sent to ${email}`);
+        } catch (err) {
+            this.logger.error(`forgotPassword: email send failed for ${email}`, err instanceof Error ? err.stack : err);
+        }
+
+        return { message: safeMessage };
+    }
+
+    async resetPassword(token: string, newPassword: string): Promise<{ message: string }> {
+        const tokenHash = this.hashToken(token);
+
+        const user = await this.userRepository.findOne({
+            where: { reset_password_token: tokenHash },
+        });
+
+        if (!user || !user.reset_password_expires_at || user.reset_password_expires_at < new Date()) {
+            throw new BadRequestException('Invalid or expired reset token');
+        }
+
+        const password_hash = await bcrypt.hash(newPassword, 10);
+
+        await this.userRepository.update(user.user_id, {
+            password_hash,
+            reset_password_token: null,
+            reset_password_expires_at: null,
+        });
+
+        return { message: 'Password updated successfully.' };
     }
 
 

@@ -7,6 +7,8 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import api from '@/lib/axios';
 import { useAuthStore } from '@/store/auth.store';
+import Link from 'next/link';
+
 
 const loginSchema = z.object({
     email: z.string().email('Invalid email'),
@@ -58,6 +60,7 @@ export default function LoginPage() {
                 <button type="submit" disabled={isSubmitting}>
                     {isSubmitting ? 'Signing in...' : 'Sign In'}
                 </button>
+                <Link href="/forgot-password">Forgot password?</Link>
             </form>
         </div>
     );

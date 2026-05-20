@@ -26,8 +26,8 @@ export class User {
     @Column({ default: false })
     is_email_verified: boolean;
 
-    @Column({ nullable: true })
-    email_verification_token: string;
+    @Column({ type: 'varchar', nullable: true })
+    email_verification_token: string | null;
 
     @CreateDateColumn()
     created_at: Date;
@@ -38,6 +38,13 @@ export class User {
     @Column({ type: 'varchar', nullable: true })
     refresh_token_hash: string | null;
 
-    @Column({ type: 'timestamp', nullable: true })
+    @Column({ type: 'timestamptz', nullable: true })
     refresh_token_expires_at: Date | null;
+
+    @Column({ type: 'varchar', nullable: true })
+    reset_password_token: string | null;
+
+    @Column({ type: 'timestamptz', nullable: true })
+    reset_password_expires_at: Date | null;
+
 }

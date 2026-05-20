@@ -798,57 +798,463 @@ Browser                      NestJS Backend               PostgreSQL
 
 ---
 
-### 5.1 The two-step flow
+### 5.1 Theory — Secure password reset design
 
-**Step 1 — Request reset:**
-```
-POST /api/v1/auth/forgot-password
-Body: { email }
+Password reset is a two-step flow separated by an email. The email is the proof of identity — if you can receive it, you own the account.
 
-1. Find user by email
-   → If not found: return success anyway (don't reveal if email exists)
-2. Generate a reset token: crypto.randomBytes(32).toString('hex')
-3. Hash it (SHA-256) and store in DB with expiry = now + 30 min
-4. Send email with link: {APP_URL}/reset-password?token=<plain_token>
-5. Return { message: 'If this email is registered, a reset link was sent.' }
+```
+Step 1 — Request:           Step 2 — Reset:
+User submits email           User clicks link in email
+      ↓                              ↓
+Server generates token        Server validates token
+Stores hash in DB             Updates password
+Sends link via email          Clears token from DB
+Returns safe message          Redirects to login
 ```
 
-**Step 2 — Perform reset:**
-```
-POST /api/v1/auth/reset-password
-Body: { token, newPassword }
+**Why hash the token stored in the DB?**
 
-1. SHA-256 hash the incoming token
-2. Find user WHERE reset_token_hash = ? AND reset_token_expires_at > NOW()
-   → If not found: throw BadRequestException('Invalid or expired token')
-3. bcrypt.hash(newPassword, 10)
-4. UPDATE user: password_hash = new hash, reset_token_hash = NULL, reset_token_expires_at = NULL
-5. Also null out refresh_token_hash (force re-login on all devices)
-6. Return { message: 'Password updated successfully' }
+The reset token is sent in a URL (visible in email clients, logs, browser history). If your database is breached while a reset token is active, an attacker could use it to take over the account. Storing the SHA-256 hash instead of the raw token means a DB breach leaks only the hash — the token in the email link is still needed.
+
+Same reasoning applies to refresh tokens (US-02). It's the same `hashToken()` private method reused here.
+
+**Why does the endpoint always return the same message?**
+
 ```
+POST /auth/forgot-password { email: "exists@example.com" }
+→ "If that email is registered, a reset link has been sent."
+
+POST /auth/forgot-password { email: "notexists@example.com" }
+→ "If that email is registered, a reset link has been sent."
+```
+
+If the server returned different responses for known vs unknown emails, an attacker could use your forgot-password endpoint as an **email enumeration tool** — submitting thousands of emails to discover which ones have accounts. The safe message eliminates this attack vector.
+
+**Why 30 minutes?**
+
+Short enough that a stolen link (from a compromised email account) has a narrow window. Long enough that a real user can act on it without rushing. This is specified in the acceptance criteria and matches industry convention.
 
 ---
 
-### 5.2 Entity columns needed
+### 5.2 Backend — Two new endpoints
 
-Add to the User entity for this user story:
+#### 5.2.1 Entity additions (`user.entity.ts`)
+
+Two new nullable columns are added to the `users` table. Both follow the three-part nullable pattern from the TypeORM conventions:
 
 ```typescript
-@Column({ nullable: true })
-reset_token_hash: string;
+@Column({ type: 'varchar', nullable: true })   // ① nullable: true in decorator
+reset_password_token: string | null;            // ② | null in TypeScript type
+                                                // ③ explicit type avoids reflect-metadata emitting 'Object'
 
 @Column({ type: 'timestamptz', nullable: true })
-reset_token_expires_at: Date;
+reset_password_expires_at: Date | null;
+```
+
+`timestamptz` (timezone-aware timestamp) is required by convention — plain `timestamp` stores no timezone and can cause subtle bugs when the server and database are in different timezones.
+
+These columns are `null` when no reset is in progress, and cleared back to `null` immediately after the reset is used — so the token is always single-use.
+
+#### 5.2.2 DTOs
+
+Two focused DTOs, one for each endpoint:
+
+```typescript
+// backend/src/auth/dto/forgot-password.dto.ts
+import { IsEmail } from 'class-validator';
+
+export class ForgotPasswordDto {
+    @IsEmail()
+    email: string;
+}
+```
+
+```typescript
+// backend/src/auth/dto/reset-password.dto.ts
+import { IsString, MinLength } from 'class-validator';
+
+export class ResetPasswordDto {
+    @IsString()
+    token: string;              // the raw token from the URL query param
+
+    @IsString()
+    @MinLength(8)
+    new_password: string;       // mirrors the minimum from RegisterDto
+}
+```
+
+The token comes from the URL (`?token=...`) but is sent in the **request body**, not as a URL parameter. This keeps credentials out of server access logs, which record the URL path but usually not the POST body.
+
+#### 5.2.3 Service — `forgotPassword`
+
+```typescript
+// backend/src/auth/auth.service.ts
+async forgotPassword(email: string): Promise<{ message: string }> {
+    const safeMessage = 'If that email is registered, a reset link has been sent.';
+
+    const user = await this.userRepository.findOne({ where: { email } });
+    this.logger.log(`forgotPassword: user found=${!!user} email=${email}`);
+    if (!user) {
+        return { message: safeMessage };   // ← same message whether user exists or not
+    }
+
+    const rawToken = crypto.randomUUID();           // 122 bits of randomness
+    const tokenHash = this.hashToken(rawToken);     // SHA-256 — stored in DB
+
+    const expiresAt = new Date();
+    expiresAt.setMinutes(expiresAt.getMinutes() + 30);   // 30-minute window
+
+    await this.userRepository.update(user.user_id, {
+        reset_password_token: tokenHash,            // hash goes to DB
+        reset_password_expires_at: expiresAt,
+    });
+
+    const appUrl = this.config.get<string>('APP_URL');
+    const resetUrl = `${appUrl}/reset-password?token=${rawToken}`;   // raw token goes to email
+    this.logger.log(`forgotPassword: reset URL generated for ${email}`);
+
+    try {
+        await this.mailService.sendPasswordResetEmail(user.email, user.full_name, resetUrl);
+        this.logger.log(`forgotPassword: email sent to ${email}`);
+    } catch (err) {
+        this.logger.error(`forgotPassword: email send failed for ${email}`, err instanceof Error ? err.stack : err);
+    }
+
+    return { message: safeMessage };
+}
+```
+
+**Key design points:**
+
+- `crypto.randomUUID()` — built into Node.js (no extra package). Generates a version 4 UUID: 122 bits of cryptographic randomness. Impossible to guess.
+- The `rawToken` goes into the email link. The `tokenHash` goes into the database. They are never in the same place at the same time.
+- The `try/catch` around `sendPasswordResetEmail` ensures the email failure is **logged** without leaking to the client. The user always sees the same safe message — they cannot tell if the send succeeded or failed.
+- `this.config.get<string>('APP_URL')` reads `APP_URL=http://localhost:3001` from `.env`. This is why `ConfigService` is injected into `AuthService` for this story.
+
+#### 5.2.4 Service — `resetPassword`
+
+```typescript
+async resetPassword(token: string, newPassword: string): Promise<{ message: string }> {
+    const tokenHash = this.hashToken(token);   // hash the incoming raw token
+
+    const user = await this.userRepository.findOne({
+        where: { reset_password_token: tokenHash },   // look up by hash
+    });
+
+    // Three-way guard: user not found, expiry null, expiry past
+    if (!user || !user.reset_password_expires_at || user.reset_password_expires_at < new Date()) {
+        throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    const password_hash = await bcrypt.hash(newPassword, 10);
+
+    await this.userRepository.update(user.user_id, {
+        password_hash,
+        reset_password_token: null,          // single-use: clear immediately
+        reset_password_expires_at: null,
+    });
+
+    return { message: 'Password updated successfully.' };
+}
+```
+
+**The three-way guard:**
+
+```
+if (!user)                              → token hash not in DB (invalid/forged)
+if (!user.reset_password_expires_at)    → column is null (no reset in progress)
+if (expires_at < new Date())            → token exists but window has passed
+```
+
+All three cases return the same `BadRequestException` — no information leakage about which condition failed.
+
+After a successful reset, `reset_password_token` and `reset_password_expires_at` are both set to `null`. The same link used twice will fail on the second attempt because the hash is no longer in the database.
+
+#### 5.2.5 Controller routes
+
+```typescript
+// backend/src/auth/auth.controller.ts
+@Post('forgot-password')
+@HttpCode(HttpStatus.OK)
+forgotPassword(@Body() dto: ForgotPasswordDto) {
+    return this.authService.forgotPassword(dto.email);
+}
+
+@Post('reset-password')
+@HttpCode(HttpStatus.OK)
+resetPassword(@Body() dto: ResetPasswordDto) {
+    return this.authService.resetPassword(dto.token, dto.new_password);
+}
+```
+
+Both routes are **public** — no `@UseGuards(JwtAuthGuard)`. The user is unauthenticated by definition when they've forgotten their password. Authentication for these endpoints is the reset token itself, not a JWT.
+
+#### 5.2.6 Mail service — new method
+
+```typescript
+// backend/src/mail/mail.service.ts
+async sendPasswordResetEmail(to: string, name: string, resetUrl: string): Promise<void> {
+    await this.transporter.sendMail({
+        from: this.config.get('MAIL_FROM'),
+        to,
+        subject: 'Reset your Betazoid password',
+        html: `
+    <h2>Hi ${name},</h2>
+    <p>Click the link below to reset your password. This link expires in 30 minutes.</p>
+    <a href="${resetUrl}">Reset Password</a>
+    <p>If you did not request a password reset, ignore this email.</p>`,
+    });
+}
+```
+
+In development, Mailtrap sandbox intercepts this email — it never reaches a real inbox. To see it, go to **mailtrap.io → Email Testing → Inboxes**.
+
+---
+
+### 5.3 Frontend — Two new pages
+
+#### 5.3.1 Forgot Password page (`/forgot-password`)
+
+```typescript
+// frontend/src/app/forgot-password/page.tsx
+'use client';
+
+import { useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { useMutation } from '@tanstack/react-query';
+import Link from 'next/link';
+import api from '@/lib/axios';
+
+const schema = z.object({
+    email: z.string().email('Enter a valid email'),
+});
+type FormData = z.infer<typeof schema>;
+
+export default function ForgotPasswordPage() {
+    const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+    const { register, handleSubmit, formState: { errors } } = useForm<FormData>({
+        resolver: zodResolver(schema),
+    });
+
+    const mutation = useMutation({
+        mutationFn: (data: FormData) =>
+            api.post('/auth/forgot-password', data).then((res) => res.data),
+        onSuccess: (data) => setSuccessMessage(data.message),
+    });
+
+    const onSubmit = (data: FormData) => mutation.mutate(data);
+
+    return (
+        <div>
+            <h1>Forgot Password</h1>
+            {successMessage ? (
+                <p>{successMessage}</p>       // ← hides the form, shows server message
+            ) : (
+                <form onSubmit={handleSubmit(onSubmit)}>
+                    <div>
+                        <label>Email</label>
+                        <input type="email" {...register('email')} />
+                        {errors.email && <p>{errors.email.message}</p>}
+                    </div>
+                    <button type="submit" disabled={mutation.isPending}>
+                        {mutation.isPending ? 'Sending...' : 'Send Reset Link'}
+                    </button>
+                    {mutation.isError && <p>Something went wrong. Please try again.</p>}
+                </form>
+            )}
+            <Link href="/login">Back to login</Link>
+        </div>
+    );
+}
+```
+
+**Design decisions:**
+
+- When `onSuccess` fires, the form is replaced by the server's message. The user cannot re-submit without refreshing — which is intentional. Re-submission too quickly could flood the user's inbox or hit a rate limit.
+- On error (`mutation.isError`), a generic message is shown — not the server's error detail. The user does not need to know *why* it failed.
+- The safe message from the server (`"If that email is registered..."`) is displayed verbatim. The frontend never knows whether the email was found; it just shows whatever the server returned.
+
+#### 5.3.2 Reset Password page (`/reset-password?token=...`)
+
+```typescript
+// frontend/src/app/reset-password/page.tsx
+'use client';
+
+import { Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { useMutation } from '@tanstack/react-query';
+import Link from 'next/link';
+import api from '@/lib/axios';
+
+const schema = z
+    .object({
+        new_password: z.string().min(8, 'Password must be at least 8 characters'),
+        confirm_password: z.string(),
+    })
+    .refine((data) => data.new_password === data.confirm_password, {
+        message: 'Passwords do not match',
+        path: ['confirm_password'],
+    });
+type FormData = z.infer<typeof schema>;
+
+function ResetPasswordForm() {
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const token = searchParams.get('token');   // reads ?token= from the URL
+
+    const { register, handleSubmit, formState: { errors } } = useForm<FormData>({
+        resolver: zodResolver(schema),
+    });
+
+    const mutation = useMutation({
+        mutationFn: (data: FormData) =>
+            api.post('/auth/reset-password', {
+                token,                          // from URL — sent in body, not query param
+                new_password: data.new_password,
+            }).then((res) => res.data),
+        onSuccess: () => router.push('/login'), // redirect on success
+    });
+
+    const onSubmit = (data: FormData) => mutation.mutate(data);
+
+    if (!token) {
+        return (
+            <div>
+                <p>Invalid reset link.</p>
+                <Link href="/forgot-password">Request a new one</Link>
+            </div>
+        );
+    }
+
+    return (
+        <div>
+            <h1>Reset Password</h1>
+            <form onSubmit={handleSubmit(onSubmit)}>
+                <div>
+                    <label>New Password</label>
+                    <input type="password" {...register('new_password')} />
+                    {errors.new_password && <p>{errors.new_password.message}</p>}
+                </div>
+                <div>
+                    <label>Confirm Password</label>
+                    <input type="password" {...register('confirm_password')} />
+                    {errors.confirm_password && <p>{errors.confirm_password.message}</p>}
+                </div>
+                <button type="submit" disabled={mutation.isPending}>
+                    {mutation.isPending ? 'Updating...' : 'Reset Password'}
+                </button>
+                {mutation.isError && <p>Invalid or expired reset link.</p>}
+            </form>
+        </div>
+    );
+}
+
+export default function ResetPasswordPage() {
+    return (
+        <Suspense fallback={<p>Loading...</p>}>
+            <ResetPasswordForm />
+        </Suspense>
+    );
+}
+```
+
+**Three things to understand:**
+
+**`useSearchParams()` requires `<Suspense>`** — In Next.js App Router, any component that calls `useSearchParams()` must be wrapped in a `<Suspense>` boundary, otherwise the build fails with a static generation error. The pattern is to split the component into an inner `ResetPasswordForm` (which uses the hook) and an outer `ResetPasswordPage` (which wraps it in `<Suspense>`).
+
+**Token read from URL, sent in body** — `searchParams.get('token')` reads the `?token=` query parameter. The token is then sent in the POST request **body**, not as a URL param, so it doesn't appear in the backend's access logs.
+
+**`confirm_password` is client-side only** — Zod's `.refine()` enforces the password-match rule locally. The backend's `ResetPasswordDto` has no `confirm_password` field — it would be redundant, and `whitelist: true` would strip it anyway.
+
+**Login page update** — A "Forgot password?" link was added to the login form to complete the entry point:
+
+```typescript
+// frontend/src/app/login/page.tsx
+import Link from 'next/link';
+
+// Inside the form, after the submit button:
+<Link href="/forgot-password">Forgot password?</Link>
 ```
 
 ---
 
-### 5.3 Security notes
+### 5.4 Security & Design Notes
 
-- **Don't reveal if an email exists** — return the same message whether the email is registered or not. This prevents attackers from using your password reset as an email enumeration tool.
-- **Invalidate after use** — once the password is reset, null the token immediately so the link can't be reused.
-- **Force re-login** — null the refresh token too, so any stolen sessions are terminated.
-- **30-minute expiry** — as required by the acceptance criteria.
+**Email enumeration prevention** — The `forgotPassword` service method returns the same `safeMessage` in two places: when the user is not found (early return) and after the email is sent. The response body is always identical. Response timing could theoretically differ (user-not-found is faster), but for a learning platform this is an acceptable trade-off.
+
+**Token is single-use** — `reset_password_token` and `reset_password_expires_at` are set to `null` on a successful reset. The same link used a second time will fail with `BadRequestException` because the hash is no longer in the DB.
+
+**No forced re-login on other devices** — The current implementation does not null the `refresh_token_hash` after a password reset. This means existing sessions on other devices remain valid. For a higher-security application you would null the refresh token here too, forcing every device to re-authenticate. This is a known design gap — acceptable for a learning platform.
+
+**Mailtrap in development** — `MAIL_HOST=sandbox.smtp.mailtrap.io` catches all outgoing emails in Mailtrap's virtual inbox. Emails never reach real addresses in development. To see the reset email, log into mailtrap.io and check **Email Testing → Inboxes**. Swap for SendGrid or Mailgun at deployment time by updating the four `MAIL_*` env vars.
+
+**NestJS `Logger`** — `AuthService` uses `private readonly logger = new Logger(AuthService.name)` instead of raw `console.log`. The NestJS logger prefixes every line with the class name and timestamp, and respects the application log level. In production you would set `LOG_LEVEL=warn` to silence `logger.log()` calls while keeping `logger.error()`.
+
+---
+
+### 5.5 The full flow
+
+```
+Browser                  NestJS                       PostgreSQL      Mailtrap
+   |                        |                              |              |
+   | POST /auth/             |                              |              |
+   | forgot-password         |                              |              |
+   | { email }               |                              |              |
+   |-----------------------> |                              |              |
+   |                    ValidationPipe                      |              |
+   |                    AuthService.forgotPassword()        |              |
+   |                         |--- SELECT users -----------> |              |
+   |                         |    WHERE email = $1          |              |
+   |                         | <--------------------------- |              |
+   |                    crypto.randomUUID() → rawToken      |              |
+   |                    SHA-256(rawToken)   → tokenHash     |              |
+   |                         |--- UPDATE users -----------> |              |
+   |                         |    SET reset_password_       |              |
+   |                         |    token = tokenHash         |              |
+   |                         |    reset_password_           |              |
+   |                         |    expires_at = now+30min    |              |
+   |                         | <--------------------------- |              |
+   |                    build resetUrl with rawToken         |              |
+   |                    MailService.sendPasswordResetEmail() |              |
+   |                         |-----------------------------------------> |
+   |                         |    SMTP send                              |
+   |                         | <---------------------------------------- |
+   | 200 { message:           |                              |              |
+   |  "If that email..." }    |                              |              |
+   | <----------------------- |                              |              |
+   |                          |                              |              |
+   | [user clicks link        |                              |              |
+   |  in Mailtrap inbox]      |                              |              |
+   |                          |                              |              |
+   | POST /auth/              |                              |              |
+   | reset-password           |                              |              |
+   | { token, new_password }  |                              |              |
+   |-----------------------> |                              |              |
+   |                    SHA-256(token) → tokenHash           |              |
+   |                         |--- SELECT users -----------> |              |
+   |                         |    WHERE reset_password_     |              |
+   |                         |    token = tokenHash         |              |
+   |                         | <--------------------------- |              |
+   |                    check expiry                         |              |
+   |                    bcrypt.hash(new_password, 10)        |              |
+   |                         |--- UPDATE users -----------> |              |
+   |                         |    SET password_hash = new   |              |
+   |                         |    reset_password_token=NULL |              |
+   |                         |    reset_password_           |              |
+   |                         |    expires_at = NULL         |              |
+   |                         | <--------------------------- |              |
+   | 200 { message:           |                              |              |
+   |  "Password updated" }    |                              |              |
+   | <----------------------- |                              |              |
+   |                          |                              |              |
+   | router.push('/login')    |                              |              |
+```
 
 ---
 

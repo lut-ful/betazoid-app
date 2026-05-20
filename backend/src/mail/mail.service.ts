@@ -27,4 +27,18 @@ export class MailService {
         <p>Your account has been created successfully. Welcome to Betazoid!</p>`,
         });
     }
+
+    async sendPasswordResetEmail(to: string, name: string, resetUrl: string): Promise<void> {
+        await this.transporter.sendMail({
+            from: this.config.get('MAIL_FROM'),
+            to,
+            subject: 'Reset your Betazoid password',
+            html: `
+    <h2>Hi ${name},</h2>
+    <p>Click the link below to reset your password. This link expires in 30 minutes.</p>
+    <a href="${resetUrl}">Reset Password</a>
+    <p>If you did not request a password reset, ignore this email.</p>`,
+        });
+    }
+
 }

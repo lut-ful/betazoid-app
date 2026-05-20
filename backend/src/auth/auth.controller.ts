@@ -1,9 +1,12 @@
-import { Body, Controller, HttpCode, HttpStatus, Post, Req, Res, UseGuards } from '@nestjs/common';
+import { Body, Controller, HttpCode, HttpStatus, Post, Req, Res, UnauthorizedException, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+
 
 @Controller('auth')
 export class AuthController {
@@ -34,7 +37,7 @@ export class AuthController {
     ) {
         const token = req.cookies['refresh_token'];
         if (!token) {
-            throw new Error('No refresh token');
+            throw new UnauthorizedException('No refresh token');
         }
         const { accessToken, refreshToken } = await this.authService.refresh(token);
         this.setRefreshCookie(res, refreshToken);
@@ -65,5 +68,18 @@ export class AuthController {
         });
         return { message: 'Logged out successfully' };
     }
+
+    @Post('forgot-password')
+    @HttpCode(HttpStatus.OK)
+    forgotPassword(@Body() dto: ForgotPasswordDto) {
+        return this.authService.forgotPassword(dto.email);
+    }
+
+    @Post('reset-password')
+    @HttpCode(HttpStatus.OK)
+    resetPassword(@Body() dto: ResetPasswordDto) {
+        return this.authService.resetPassword(dto.token, dto.new_password);
+    }
+
 
 }
