@@ -1,6 +1,7 @@
 import { MailModule } from './mail/mail.module';
 import { AuthModule } from './auth/auth.module';
 import { CategoriesModule } from './categories/categories.module';
+import { CoursesModule } from './courses/courses.module';
 import { PermissionsModule } from './permissions/permissions.module';
 import { RedisModule } from './redis/redis.module';
 import { RolesModule } from './roles/roles.module';
@@ -33,6 +34,7 @@ import { PermissionsGuard } from './auth/guards/permissions.guard';
     AuthModule,
     MailModule,
     CategoriesModule,
+    CoursesModule,
     PermissionsModule,
     RolesModule,
     UsersModule,
