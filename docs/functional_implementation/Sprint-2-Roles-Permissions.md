@@ -13,6 +13,7 @@
 2. [US-07 — Assign Permissions to Role](#2-us-07--assign-permissions-to-role)
 3. [US-08 — Assign Role to User](#3-us-08--assign-role-to-user)
 4. [US-09 — Edit or Delete Role](#4-us-09--edit-or-delete-role)
+5. [US-10 — Enforce Permissions on API Requests](#5-us-10--enforce-permissions-on-api-requests)
 
 ---
 
@@ -1973,3 +1974,642 @@ Browser (/admin/roles)        NestJS                        PostgreSQL
     role lose it on their next    │                               │
     request (user_roles gone)     │                               │
 ```
+
+---
+
+## 5. US-10 — Enforce Permissions on API Requests
+
+> *As the system, I want to enforce permissions on every API request so that unauthorized users cannot access restricted resources.*
+
+### Acceptance Criteria
+- Every protected endpoint checks the authenticated user's permissions
+- Unauthorized requests return a 403 response
+- Permission checks use cached data from Redis to reduce database load
+
+---
+
+### 5.1 Theory — From role-checking to permission-checking
+
+#### What US-07–US-09 built, and what US-10 does with it
+
+By the end of US-09, the platform has a complete permission catalogue in the `permissions` table, roles with permission sets in `role_permissions`, and users assigned to roles in `user_roles`. But no endpoint enforces any of that data. Every protected route is still gated only by the blunt `SuperAdminGuard` — "are you a Super Admin?" — not by the granular permission system.
+
+US-10 closes that gap. It builds the infrastructure that makes the question "does this user have the `read:permissions` permission?" answerable on every request.
+
+#### The SuperAdminGuard limitation
+
+`SuperAdminGuard` asks a binary question and hard-codes the answer in code:
+
+```
+Does user_roles contain a row where role.name = 'Super Admin'?
+    Yes → allow
+    No  → 403
+```
+
+It is not configurable. You cannot say "allow moderators too" without changing the source code. It is also database-heavy — one extra SQL query on every request, on every endpoint it protects.
+
+The `PermissionsGuard` built in US-10 replaces this approach with a declarative one: a decorator tags which permission a route needs, and the guard enforces it — with Redis caching to avoid the per-request database cost.
+
+```
+Developer annotates the route:
+    @RequirePermission('publish:courses')
+
+At runtime:
+    PermissionsGuard checks: does this user's permission set include 'publish:courses'?
+        Yes → allow
+        No  → 403
+```
+
+The guard is completely data-driven. Adding a new permission to a role takes effect without touching any code.
+
+#### The NestJS guard pipeline
+
+NestJS executes guards in a strict order, and understanding that order explains every design decision in US-10.
+
+```
+Incoming request
+      │
+      ▼
+Global guards  ← registered via APP_GUARD in AppModule
+      │            run on EVERY route, in registration order
+      │
+      ▼
+Controller-level guards  ← @UseGuards(...) on the class
+      │
+      ▼
+Route-level guards  ← @UseGuards(...) on the method
+      │
+      ▼
+Route handler executes
+```
+
+**The ordering constraint:** `PermissionsGuard` needs `request.user` (set by `JwtAuthGuard`) to be populated before it runs. If `PermissionsGuard` is global but `JwtAuthGuard` is route-level, the permissions guard runs first — before the user is authenticated — and `request.user` is `undefined`.
+
+The solution: register **both** guards globally, in the right order:
+
+```typescript
+// AppModule providers:
+{ provide: APP_GUARD, useClass: JwtAuthGuard },      // 1st — authenticates user, sets request.user
+{ provide: APP_GUARD, useClass: PermissionsGuard },  // 2nd — checks permissions using request.user
+```
+
+This means `JwtAuthGuard` now runs on every single route — including public ones like `POST /auth/login` and `POST /auth/register`. Those routes must be marked with `@Public()` to opt out of JWT validation.
+
+#### The @Public() decorator
+
+`@Public()` is just metadata — a marker the guards check before doing any work:
+
+```
+@Public() on a route handler
+         │
+         ▼
+JwtAuthGuard sees IS_PUBLIC_KEY = true → returns true immediately (no JWT needed)
+PermissionsGuard sees IS_PUBLIC_KEY = true → returns true immediately (no permission check)
+```
+
+Without `@Public()`, both guards run their full logic. With it, both skip entirely. Public routes remain completely open to unauthenticated requests.
+
+#### Why Redis? The N×M problem
+
+Without caching, `PermissionsGuard` runs a three-table JOIN on every protected request:
+
+```sql
+SELECT p.name
+FROM user_roles ur
+INNER JOIN role_permissions rp ON rp.role_id = ur.role_id
+INNER JOIN permissions p ON p.permission_id = rp.permission_id
+WHERE ur.user_id = $1
+```
+
+If Betazoid has 1,000 active users each making 10 requests per second, that is 10,000 permission queries per second — all reading data that almost never changes. This is the classic case for a read-through cache.
+
+**Cache design:**
+- Key: `user_perms:{userId}` — one key per user
+- Value: JSON array of permission name strings — `["read:permissions","create:courses",...]`
+- TTL: 300 seconds (5 minutes) — permissions are re-read from DB after the TTL expires
+- Invalidation: explicit `DEL user_perms:{userId}` when that user's roles change
+
+```
+First request (cache miss):
+    Redis GET user_perms:abc → null
+    DB query → ["read:permissions", "create:courses"]
+    Redis SET user_perms:abc '["read:permissions","create:courses"]' EX 300
+    → serve request
+
+All subsequent requests within 5 minutes (cache hit):
+    Redis GET user_perms:abc → '["read:permissions","create:courses"]'
+    → serve request (no DB query)
+```
+
+#### Cache invalidation: two triggers
+
+A user's cached permissions become stale in two situations:
+
+1. **`assignRolesToUser` is called** — the user's role set changes. Their permission set changes with it. The cache for that specific user is deleted immediately.
+
+2. **`assignPermissions` is called** — a role's permission set changes. Every user who holds that role has a stale cache. The service finds all users with that role and deletes their caches.
+
+This explicit invalidation means permission changes take effect on the user's **very next request** — not after the 5-minute TTL.
+
+---
+
+### 5.2 Backend — The guard infrastructure
+
+This US is entirely backend. There is no new frontend page — `PermissionsGuard` is transparent to the client.
+
+#### New files created
+
+| File | Purpose |
+|---|---|
+| `redis/redis.service.ts` | Wraps the `ioredis` client |
+| `redis/redis.module.ts` | Global NestJS module, exports `RedisService` |
+| `auth/decorators/public.decorator.ts` | `@Public()` — opt a route out of all global guards |
+| `auth/decorators/require-permission.decorator.ts` | `@RequirePermission(perm)` — tag a route with a required permission |
+| `auth/guards/permissions.guard.ts` | The RBAC guard — reads metadata, checks Redis/DB |
+
+#### Modified files
+
+| File | Change |
+|---|---|
+| `docker-compose.yml` | Added `redis:7-alpine` service on port 6379 |
+| `backend/.env` | Added `REDIS_HOST`, `REDIS_PORT` |
+| `auth/guards/jwt-auth.guard.ts` | Now `Reflector`-aware, skips on `@Public()` |
+| `app.module.ts` | Imports `RedisModule`, registers both global guards |
+| `roles/roles.service.ts` | Injects `RedisService`, invalidates cache on role/permission changes |
+| `permissions/permissions.controller.ts` | Demonstrates `@RequirePermission('read:permissions')` |
+
+---
+
+#### `RedisService` — `redis/redis.service.ts`
+
+```typescript
+@Injectable()
+export class RedisService implements OnModuleInit, OnModuleDestroy {
+    private client: Redis;
+
+    constructor(private readonly config: ConfigService) {}
+
+    onModuleInit() {
+        this.client = new Redis({
+            host: this.config.get<string>('REDIS_HOST', 'localhost'),
+            port: this.config.get<number>('REDIS_PORT', 6379),
+            lazyConnect: true,
+            // lazyConnect: true — the TCP connection to Redis is NOT established
+            // when the module initialises. It is established on the first command.
+            // This prevents startup failures if Redis is temporarily unavailable
+            // while the NestJS application is booting.
+        });
+    }
+
+    async onModuleDestroy() {
+        await this.client.quit();
+        // Gracefully closes the connection when the application shuts down.
+        // Without this, the Node.js process may hang waiting for open sockets.
+    }
+
+    async get(key: string): Promise<string | null> {
+        return this.client.get(key);
+    }
+
+    async set(key: string, value: string, ttlSeconds: number): Promise<void> {
+        await this.client.set(key, value, 'EX', ttlSeconds);
+        // 'EX' sets an expiry in seconds. The key is automatically deleted
+        // by Redis when the TTL expires — no manual cleanup needed.
+    }
+
+    async del(...keys: string[]): Promise<void> {
+        if (keys.length > 0) await this.client.del(...keys);
+        // Variadic — accepts one key or many. Passing zero keys to Redis DEL
+        // is an error, so we guard with the length check.
+        // ioredis spreads the array into individual arguments for the DEL command.
+    }
+}
+```
+
+#### `RedisModule` — `redis/redis.module.ts`
+
+```typescript
+@Global()
+// @Global() makes RedisService available for injection in every module
+// without needing to import RedisModule explicitly. Since caching is a
+// cross-cutting concern (the guard and the service both need it),
+// global scope avoids repetitive import declarations.
+@Module({
+    providers: [RedisService],
+    exports: [RedisService],
+})
+export class RedisModule {}
+```
+
+#### The decorators
+
+```typescript
+// auth/decorators/public.decorator.ts
+export const IS_PUBLIC_KEY = 'isPublic';
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+// SetMetadata attaches arbitrary data to a route handler or controller class.
+// The guard then reads this data with Reflector.getAllAndOverride().
+
+// auth/decorators/require-permission.decorator.ts
+export const PERMISSION_KEY = 'required_permission';
+export const RequirePermission = (permission: string) =>
+    SetMetadata(PERMISSION_KEY, permission);
+// Usage: @RequirePermission('publish:courses')
+// Stores 'publish:courses' in the route's metadata under the PERMISSION_KEY.
+```
+
+These decorators have zero runtime cost when the route is not called. They are pure metadata — no logic, no dependencies.
+
+#### Updated `JwtAuthGuard` — `auth/guards/jwt-auth.guard.ts`
+
+```typescript
+@Injectable()
+export class JwtAuthGuard extends AuthGuard('jwt') {
+    constructor(private reflector: Reflector) {
+        super();
+        // Reflector is NestJS's metadata reader — it is always available
+        // for injection without importing any module.
+    }
+
+    canActivate(context: ExecutionContext) {
+        const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+            context.getHandler(),   // check the route method first
+            context.getClass(),     // then the controller class
+        ]);
+        // getAllAndOverride: returns the first truthy value found.
+        // Method-level metadata wins over class-level — a public route on
+        // a non-public controller works correctly.
+
+        if (isPublic) return true;
+        // Short-circuit — no JWT validation, request.user stays undefined.
+        // PermissionsGuard will also see @Public() and skip its check.
+
+        return super.canActivate(context);
+        // Falls through to Passport's AuthGuard('jwt'), which:
+        //   1. Extracts the Bearer token from the Authorization header
+        //   2. Verifies the JWT signature using JWT_SECRET
+        //   3. Calls JwtStrategy.validate() to build request.user
+        //   4. Returns true (or throws UnauthorizedException if invalid)
+    }
+}
+```
+
+#### `PermissionsGuard` — `auth/guards/permissions.guard.ts`
+
+```typescript
+@Injectable()
+export class PermissionsGuard implements CanActivate {
+    constructor(
+        private readonly reflector: Reflector,
+        @InjectDataSource() private readonly dataSource: DataSource,
+        // DataSource is the TypeORM connection object. It is always available
+        // when TypeOrmModule.forRootAsync() has been configured in AppModule.
+        // We use it to run raw-ish query builder queries without needing
+        // a specific TypeORM repository injected.
+        private readonly redisService: RedisService,
+        // RedisService is injected from the global RedisModule.
+    ) {}
+
+    async canActivate(context: ExecutionContext): Promise<boolean> {
+        // Step 1: skip immediately on @Public() routes
+        const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+            context.getHandler(),
+            context.getClass(),
+        ]);
+        if (isPublic) return true;
+
+        // Step 2: skip if no @RequirePermission() on this route
+        const required = this.reflector.getAllAndOverride<string | undefined>(
+            PERMISSION_KEY,
+            [context.getHandler(), context.getClass()],
+        );
+        if (!required) return true;
+        // A route with JwtAuthGuard but no @RequirePermission() is
+        // "authenticated but not permission-gated" — any logged-in user can access it.
+
+        // Step 3: get the authenticated user's ID (set by JwtAuthGuard)
+        const request = context.switchToHttp().getRequest();
+        const userId: string | undefined = request.user?.userId;
+        if (!userId) throw new ForbiddenException();
+        // This should never happen if the global JwtAuthGuard ran first
+        // (which it always does on non-@Public() routes), but we guard anyway.
+
+        // Step 4: load permissions (from cache or DB)
+        const permissions = await this.loadPermissions(userId);
+
+        // Step 5: enforce
+        if (!permissions.has(required)) throw new ForbiddenException();
+        return true;
+    }
+
+    async loadPermissions(userId: string): Promise<Set<string>> {
+        const cacheKey = `user_perms:${userId}`;
+
+        // Cache read
+        const cached = await this.redisService.get(cacheKey);
+        if (cached) {
+            return new Set<string>(JSON.parse(cached) as string[]);
+            // Parse the stored JSON array back into a Set for O(1) lookups.
+        }
+
+        // Cache miss — query the database
+        const rows = await this.dataSource
+            .createQueryBuilder()
+            .select('p.name', 'permission_name')
+            .from('user_roles', 'ur')
+            .innerJoin('role_permissions', 'rp', 'rp.role_id = ur.role_id')
+            // role_permissions is the join table from @ManyToMany on Role.
+            // We reference it by raw table name because we are not loading
+            // TypeORM entities — just running a shaped SQL query.
+            .innerJoin('permissions', 'p', 'p.permission_id = rp.permission_id')
+            .where('ur.user_id = :userId', { userId })
+            .getRawMany<{ permission_name: string }>();
+        // getRawMany() returns plain objects, not TypeORM entities.
+        // Result shape: [{ permission_name: 'read:permissions' }, ...]
+
+        const names = rows.map((r) => r.permission_name);
+
+        // Cache write — store for 5 minutes
+        await this.redisService.set(cacheKey, JSON.stringify(names), 300);
+
+        return new Set<string>(names);
+        // Set.has() is O(1) — faster than array.includes() for permission checks.
+    }
+}
+```
+
+#### AppModule — global guard registration
+
+```typescript
+@Module({
+    imports: [
+        RedisModule,    // ← new: global, exports RedisService to the whole app
+        ConfigModule.forRoot({ isGlobal: true }),
+        TypeOrmModule.forRootAsync({ ... }),
+        AuthModule,
+        MailModule,
+        PermissionsModule,
+        RolesModule,
+        UsersModule,
+    ],
+    providers: [
+        { provide: APP_GUARD, useClass: JwtAuthGuard },
+        // Registered first → runs first. Authenticates every request.
+        // Sets request.user from the JWT payload.
+        // Skips (returns true) on @Public() routes.
+
+        { provide: APP_GUARD, useClass: PermissionsGuard },
+        // Registered second → runs second. Has access to request.user.
+        // Skips if no @RequirePermission() decorator.
+        // Enforces 403 if the user lacks the required permission.
+    ],
+})
+export class AppModule {}
+```
+
+**Why `APP_GUARD` and not `@UseGuards()` on every controller?**
+
+`@UseGuards()` on a controller is opt-in — a developer can forget it. `APP_GUARD` is opt-out — the guard always runs, and the developer explicitly marks public routes with `@Public()`. This is a safer default: new endpoints are protected unless deliberately opened.
+
+#### Public auth endpoints — `auth/auth.controller.ts`
+
+Five endpoints are marked `@Public()`:
+
+```typescript
+@Post('register')
+@Public()           // ← new
+@HttpCode(HttpStatus.CREATED)
+register(@Body() dto: RegisterDto) { ... }
+
+@Post('login')
+@Public()           // ← new
+@HttpCode(HttpStatus.OK)
+async login(...) { ... }
+
+@Post('refresh')
+@Public()           // ← new — uses cookie, not Bearer token
+@HttpCode(HttpStatus.OK)
+async refresh(...) { ... }
+
+@Post('forgot-password')
+@Public()           // ← new
+@HttpCode(HttpStatus.OK)
+forgotPassword(...) { ... }
+
+@Post('reset-password')
+@Public()           // ← new
+@HttpCode(HttpStatus.OK)
+resetPassword(...) { ... }
+```
+
+`POST /auth/logout` is NOT marked `@Public()` — it requires authentication (you must be logged in to log out), and the global `JwtAuthGuard` handles that automatically.
+
+#### Cache invalidation in `RolesService` — `roles/roles.service.ts`
+
+Two methods were updated to invalidate the cache after mutating role data.
+
+**`assignRolesToUser` — invalidate the single user's cache:**
+
+```typescript
+async assignRolesToUser(userId: string, dto: AssignRolesDto): Promise<void> {
+    // ... existing full-replace logic (delete + insert user_roles) ...
+
+    // Invalidate this user's cached permission set
+    await this.redisService.del(`user_perms:${userId}`);
+    // The user's next request will miss the cache and query the DB,
+    // which will now reflect the new role assignments.
+}
+```
+
+**`assignPermissions` — invalidate all users who hold this role:**
+
+```typescript
+async assignPermissions(roleId: string, dto: AssignPermissionsDto): Promise<Role> {
+    // ... existing save logic ...
+    const saved = await this.roleRepo.save(role);
+
+    // Find all users who hold this role
+    const affected = await this.userRoleRepo.find({
+        where: { role: { role_id: roleId } },
+        relations: ['user'],
+    });
+    const keys = affected.map((ur) => `user_perms:${ur.user.user_id}`);
+    await this.redisService.del(...keys);
+    // Passes all keys to a single Redis DEL command — one round-trip
+    // regardless of how many users hold this role.
+
+    return saved;
+}
+```
+
+The `RedisService.del(...keys)` variadic signature handles both the single-user and multi-user cases with one method.
+
+#### Demonstrating the guard — `permissions/permissions.controller.ts`
+
+```typescript
+@Controller('permissions')
+@UseGuards(SuperAdminGuard)
+// SuperAdminGuard is still useful here as a role-level check.
+// The global JwtAuthGuard handles authentication before SuperAdminGuard runs.
+export class PermissionsController {
+    constructor(private readonly permissionsService: PermissionsService) {}
+
+    @Get()
+    @RequirePermission('read:permissions')
+    // Layered enforcement:
+    //   Global JwtAuthGuard → must be logged in
+    //   Global PermissionsGuard → must have 'read:permissions' permission
+    //   Controller SuperAdminGuard → must also have the 'Super Admin' role
+    // All three must pass for the request to reach findAll().
+    findAll() {
+        return this.permissionsService.findAll();
+    }
+}
+```
+
+This pattern — role check AND permission check — gives the most control. A future story could remove `SuperAdminGuard` from this controller and rely entirely on `@RequirePermission`, making access purely permission-driven with no hard-coded role names.
+
+---
+
+### 5.3 Frontend — No new page
+
+US-10 is a system-level feature. There is no frontend UI to build. The guard is transparent to the browser — a 403 response looks the same whether it came from `SuperAdminGuard` or `PermissionsGuard`. Existing frontend pages that already handle error states (e.g., redirect to `/login` on 401, show an error message on 403) continue to work without changes.
+
+Future user stories will annotate their new endpoints with `@RequirePermission()` as part of their implementation.
+
+---
+
+### 5.4 Security / Design Notes
+
+**Why 403 and not 401?**
+
+HTTP status codes have precise meanings:
+- `401 Unauthorized` — you are not authenticated (no valid identity)
+- `403 Forbidden` — you are authenticated, but not allowed to do this
+
+`PermissionsGuard` only runs after `JwtAuthGuard` confirms a valid identity. By the time `PermissionsGuard` throws, the user is known — so `403 Forbidden` is semantically correct. Returning 401 would imply the user needs to log in, which is wrong and confusing.
+
+**The 5-minute TTL is a deliberate trade-off**
+
+A shorter TTL means fresher data but more DB queries. A longer TTL means fewer queries but delayed propagation of permission changes. 5 minutes was chosen as a balance — fast enough that a revoked permission takes effect within one coffee break, slow enough to absorb high request volume without database pressure.
+
+The explicit cache invalidation on `assignRolesToUser` and `assignPermissions` means the TTL is only a safety net. In practice, permission changes propagate immediately via `DEL`.
+
+**What if Redis is unavailable?**
+
+If Redis is down and `this.redisService.get()` throws, the error propagates up through `canActivate()` and NestJS returns a `500 Internal Server Error`. There is no automatic fallback to the database.
+
+This is intentional for production safety: a failed permission check (due to infrastructure error) should fail closed, not open. A future hardening measure would catch Redis errors and fall back to the DB query:
+
+```typescript
+// Defensive fallback (not implemented in Sprint 2 — deferring to Sprint 10 QA):
+try {
+    const cached = await this.redisService.get(cacheKey);
+    if (cached) return new Set(JSON.parse(cached));
+} catch {
+    // Redis unavailable — fall through to DB query
+}
+```
+
+**`@Public()` is a trust boundary**
+
+Any route decorated with `@Public()` is completely unauthenticated and receives **zero** guard protection. Be deliberate: `@Public()` should only appear on routes that genuinely need anonymous access (login, registration, password reset, public course listing). A mistake — adding `@Public()` to a sensitive endpoint — bypasses both authentication and permission checks simultaneously.
+
+**SuperAdminGuard vs PermissionsGuard: when to use which**
+
+| Guard | Question | Hard-coded? | Redis caching? |
+|---|---|---|---|
+| `SuperAdminGuard` | "Does the user have the 'Super Admin' role?" | Yes — role name is in code | No |
+| `PermissionsGuard` | "Does the user have permission X?" | No — permission string is in decorator metadata | Yes |
+
+`SuperAdminGuard` is kept for Sprint 2 endpoints because the `roles` and `permissions` endpoints should always be restricted to Super Admins — even if the Super Admin role is renamed or its permissions are changed. It is a safety anchor. `PermissionsGuard` is for all other access control going forward.
+
+---
+
+### 5.5 The full flow
+
+```
+Browser (any protected request)     NestJS                      Redis       PostgreSQL
+         │                             │                           │               │
+         │── GET /api/v1/permissions ──►│                           │               │
+         │   Authorization: Bearer <t>  │                           │               │
+         │                             │                           │               │
+         │                      ┌──────▼──────────┐               │               │
+         │                      │ Global           │               │               │
+         │                      │ JwtAuthGuard     │               │               │
+         │                      │ (runs 1st)       │               │               │
+         │                      │                  │               │               │
+         │                      │ isPublic? → No   │               │               │
+         │                      │ verify JWT ──────────────────────────────────────► (internal)
+         │                      │ set request.user │               │               │
+         │                      │ { userId, email }│               │               │
+         │                      └──────┬──────────┘               │               │
+         │                             │                           │               │
+         │                      ┌──────▼──────────┐               │               │
+         │                      │ Global           │               │               │
+         │                      │ PermissionsGuard │               │               │
+         │                      │ (runs 2nd)       │               │               │
+         │                      │                  │               │               │
+         │                      │ isPublic? → No   │               │               │
+         │                      │ required = 'read:permissions'    │               │
+         │                      │ userId = request.user.userId     │               │
+         │                      │                  │               │               │
+         │                      │ GET user_perms:  │               │               │
+         │                      │ {userId} ────────────────────────►               │
+         │                      │                  │               │               │
+         │                      │      ┌───────────┴─────────┐     │               │
+         │                      │      │ Cache HIT            │     │               │
+         │                      │      │ return JSON array    │     │               │
+         │                      │      └──────────────────────┘     │               │
+         │                      │               OR                  │               │
+         │                      │      ┌───────────────────────┐    │               │
+         │                      │      │ Cache MISS             │    │               │
+         │                      │      │ SELECT p.name          │    │               │
+         │                      │      │ FROM user_roles ur     │    │               │
+         │                      │      │ JOIN role_permissions  │    │               │
+         │                      │      │ JOIN permissions p     │    │               │
+         │                      │      │ WHERE ur.user_id = $1  ────────────────────►│
+         │                      │      │                        │    │     results   │
+         │                      │      │◄───────────────────────────────────────────│
+         │                      │      │ SET user_perms:{id}    │    │               │
+         │                      │      │ '[...]' EX 300 ─────────────►              │
+         │                      │      └───────────────────────┘    │               │
+         │                      │                  │               │               │
+         │                      │ permissions.has('read:permissions')               │
+         │                      │    true → pass                   │               │
+         │                      │    false → 403 Forbidden ────────────────────────────────► browser
+         │                      └──────┬──────────┘               │               │
+         │                             │                           │               │
+         │                      ┌──────▼──────────┐               │               │
+         │                      │ Controller guard │               │               │
+         │                      │ SuperAdminGuard  │               │               │
+         │                      │                  │               │               │
+         │                      │ query user_roles ─────────────────────────────────►│
+         │                      │ WHERE role = 'Super Admin'       │               │
+         │                      │◄──────────────────────────────────────────────────│
+         │                      └──────┬──────────┘               │               │
+         │                             │                           │               │
+         │                      PermissionsController.findAll()    │               │
+         │                            │── SELECT permissions ───────────────────────►│
+         │                            │   ORDER BY name ASC        │               │
+         │                            │◄───────────────────────────────────────────│
+         │◄── 200 [ permissions ] ─────│                           │               │
+         │                             │                           │               │
+         │                             │                           │               │
+═══════════════════ Cache invalidation after assignPermissions ════════════════════
+         │                             │                           │               │
+         │── PUT /roles/:id/permissions►│                           │               │
+         │   { permissionIds: [...] }   │                           │               │
+         │                      RolesService.assignPermissions()   │               │
+         │                            │── UPDATE role_permissions ──────────────────►│
+         │                            │── find all users with role ─────────────────►│
+         │                            │◄──────────────────────────────────────────│
+         │                            │                            │               │
+         │                            │── DEL user_perms:uid1 ─────►               │
+         │                            │   DEL user_perms:uid2 ─────► (one command) │
+         │◄── 200 { role } ────────────│                           │               │
+         │                             │                           │               │
+         │   affected users' next request hits cache MISS          │               │
+         │   and loads fresh permissions from DB                   │               │
+```
+

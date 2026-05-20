@@ -6,6 +6,7 @@ import { LoginDto } from './dto/login.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { Public } from './decorators/public.decorator';
 
 
 @Controller('auth')
@@ -13,12 +14,14 @@ export class AuthController {
     constructor(private authService: AuthService) { }
 
     @Post('register')
+    @Public()
     @HttpCode(HttpStatus.CREATED)
     register(@Body() dto: RegisterDto) {
         return this.authService.register(dto);
     }
 
     @Post('login')
+    @Public()
     @HttpCode(HttpStatus.OK)
     async login(
         @Body() dto: LoginDto,
@@ -30,6 +33,7 @@ export class AuthController {
     }
 
     @Post('refresh')
+    @Public()
     @HttpCode(HttpStatus.OK)
     async refresh(
         @Req() req: Request,
@@ -70,12 +74,14 @@ export class AuthController {
     }
 
     @Post('forgot-password')
+    @Public()
     @HttpCode(HttpStatus.OK)
     forgotPassword(@Body() dto: ForgotPasswordDto) {
         return this.authService.forgotPassword(dto.email);
     }
 
     @Post('reset-password')
+    @Public()
     @HttpCode(HttpStatus.OK)
     resetPassword(@Body() dto: ResetPasswordDto) {
         return this.authService.resetPassword(dto.token, dto.new_password);

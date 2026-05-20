@@ -2,6 +2,7 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { InjectRepository } from '@nestjs/typeorm';
 import { ILike, In, Repository } from 'typeorm';
 import { Permission } from '../permissions/entities/permission.entity';
+import { RedisService } from '../redis/redis.service';
 import { User } from '../users/entities/user.entity';
 import { AssignPermissionsDto } from './dto/assign-permissions.dto';
 import { AssignRolesDto } from './dto/assign-roles.dto';
@@ -21,6 +22,7 @@ export class RolesService {
         private readonly userRepo: Repository<User>,
         @InjectRepository(UserRole)
         private readonly userRoleRepo: Repository<UserRole>,
+        private readonly redisService: RedisService,
     ) {}
 
     async create(dto: CreateRoleDto): Promise<Role> {
@@ -86,7 +88,17 @@ export class RolesService {
                 ? await this.permissionRepo.findBy({ permission_id: In(dto.permissionIds) })
                 : [];
         role.permissions = permissions;
-        return this.roleRepo.save(role);
+        const saved = await this.roleRepo.save(role);
+
+        // Invalidate cache for all users who hold this role
+        const affected = await this.userRoleRepo.find({
+            where: { role: { role_id: roleId } },
+            relations: ['user'],
+        });
+        const keys = affected.map((ur) => `user_perms:${ur.user.user_id}`);
+        await this.redisService.del(...keys);
+
+        return saved;
     }
 
     async searchUsers(query: string): Promise<Partial<User>[]> {
@@ -142,5 +154,8 @@ export class RolesService {
             const userRoles = roles.map((role) => this.userRoleRepo.create({ user, role }));
             await this.userRoleRepo.save(userRoles);
         }
+
+        // Invalidate this user's cached permission set
+        await this.redisService.del(`user_perms:${userId}`);
     }
 }
