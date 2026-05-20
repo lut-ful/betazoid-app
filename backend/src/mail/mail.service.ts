@@ -60,4 +60,37 @@ export class MailService {
         });
     }
 
+    async sendCourseApprovedNotification(
+        to: string,
+        instructorName: string,
+        courseTitle: string,
+    ): Promise<void> {
+        await this.transporter.sendMail({
+            from: this.config.get('MAIL_FROM'),
+            to,
+            subject: `Your course has been approved: ${courseTitle}`,
+            html: `
+    <h2>Congratulations, ${instructorName}!</h2>
+    <p>Your course <strong>${courseTitle}</strong> has been approved and is now published on Betazoid.</p>`,
+        });
+    }
+
+    async sendCourseRejectedNotification(
+        to: string,
+        instructorName: string,
+        courseTitle: string,
+        reason: string,
+    ): Promise<void> {
+        await this.transporter.sendMail({
+            from: this.config.get('MAIL_FROM'),
+            to,
+            subject: `Your course requires changes: ${courseTitle}`,
+            html: `
+    <h2>Hi ${instructorName},</h2>
+    <p>Your course <strong>${courseTitle}</strong> was not approved at this time.</p>
+    <p><strong>Reason:</strong> ${reason}</p>
+    <p>You can edit your course and resubmit it for review.</p>`,
+        });
+    }
+
 }

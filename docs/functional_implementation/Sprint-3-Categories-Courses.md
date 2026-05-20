@@ -1378,3 +1378,569 @@ Browser (instructor)       NestJS                         PostgreSQL
         |              → throw BadRequestException            |
         |<-- 400 "Only draft or rejected courses can be submitted for review"
 ```
+
+---
+
+## 4. US-14 — Approve or Reject Course
+
+> *As an Admin or Moderator, I want to approve or reject a submitted course so that only quality content is published.*
+
+### Acceptance Criteria
+- Moderator can view the full course content before deciding
+- Approved course status changes to Published
+- Rejected course returns to the Instructor with a reason
+- Instructor can edit and resubmit a rejected course
+
+---
+
+### 4.1 Theory — Content Moderation as a State Machine Transition
+
+US-13 moved a course from `DRAFT` → `PENDING` and placed it in an admin queue. US-14 completes both exit paths from `PENDING`:
+
+```
+          PENDING
+             |
+     ┌───────┴───────┐
+  [approve]       [reject]
+     ↓                ↓
+ PUBLISHED         REJECTED
+                      |
+                 [instructor edits
+                  and re-submits]
+                      ↓
+                  PENDING  (cycle continues)
+```
+
+Both transitions are performed by a user with the `approve:courses` permission — typically a role named Admin or Moderator. Because Betazoid uses dynamic RBAC (US-07, US-10), there is no hardcoded role check. The permission name `approve:courses` is what matters; which roles hold it is configured entirely in the database.
+
+**Why rejection carries a reason string, but approval does not?**
+
+Approval is a binary outcome that needs no explanation — the content meets the standard. Rejection, however, requires the instructor to understand *what* to fix before resubmitting. A reason string is the minimum necessary feedback. A more elaborate system might use categories or inline comments, but for this platform a plain text reason is sufficient.
+
+The reason is stored on the course record (`rejection_reason` column) so it is visible in the instructor's dashboard even after they log out and back in. It is also emailed immediately so they do not have to log in to find out their course was rejected.
+
+**When does `rejection_reason` get cleared?**
+
+On approval: `rejection_reason` is explicitly set to `null` because a course moving from `REJECTED` back through `PENDING` and then to `PUBLISHED` should not carry an old rejection note. This is an intentional design choice — the approval wipes the previous rejection reason, signaling that the course now meets the standard.
+
+---
+
+### 4.2 Backend — The Approve and Reject Endpoints
+
+#### New column — `course.entity.ts`
+
+```typescript
+@Column({ type: 'text', nullable: true })
+rejection_reason!: string | null;
+```
+
+All three parts of the nullable column pattern are present:
+- `nullable: true` in the decorator → PostgreSQL allows NULL
+- explicit `type: 'text'` → avoids `reflect-metadata` emitting `Object` for the union type
+- `| null` in the TypeScript type → TypeScript allows passing `null` in `save()` calls
+
+A fresh course has `rejection_reason = null`. It is set when the course is rejected, and cleared back to `null` on approval.
+
+Because `synchronize: true` is active in development, TypeORM automatically adds this column to the database table on the next application start — no manual migration needed in development.
+
+---
+
+#### New DTO — `reject-course.dto.ts`
+
+```typescript
+export class RejectCourseDto {
+    @IsString()
+    @IsNotEmpty()
+    reason!: string;
+}
+```
+
+This is intentionally minimal. The `@IsNotEmpty()` decorator means an empty string `""` will fail validation (class-validator's `ValidationPipe` returns a `400` before the controller even runs). A rejection with a blank reason would be useless to the instructor, so this is enforced at the API boundary.
+
+There is no `ApproveDto` — the approve endpoint needs no body. The course ID in the URL is the only input required.
+
+---
+
+#### New routes — `courses.controller.ts`
+
+```typescript
+@Get('pending')
+@RequirePermission('approve:courses')
+findPending() {
+    return this.coursesService.findPending();
+}
+
+@Get(':id/review')
+@RequirePermission('approve:courses')
+findOneForReview(@Param('id') id: string) {
+    return this.coursesService.findOneForReview(id);
+}
+
+@Post(':id/approve')
+@HttpCode(HttpStatus.OK)
+@RequirePermission('approve:courses')
+approve(@Param('id') id: string) {
+    return this.coursesService.approveCourse(id);
+}
+
+@Post(':id/reject')
+@HttpCode(HttpStatus.OK)
+@RequirePermission('approve:courses')
+reject(@Param('id') id: string, @Body() dto: RejectCourseDto) {
+    return this.coursesService.rejectCourse(id, dto);
+}
+```
+
+**Route ordering matters.** `GET /courses/pending` must be declared *before* `GET /courses/:id` in the controller. NestJS matches routes top-to-bottom. If `:id` came first, the string `"pending"` would be captured as the `:id` parameter and sent to `findOne()` with `instructorId`, causing a confusing 403 or 404.
+
+**Why `@RequirePermission` and no `@UseGuards(PermissionsGuard)` per route?**
+
+`PermissionsGuard` is registered globally in `AppModule` as an `APP_GUARD`. It runs on every request automatically, reading the `@RequirePermission()` metadata from the handler. Adding `@UseGuards(PermissionsGuard)` on top of the global registration would create a *second instance* of the guard that is not wired into the DI container the same way — the correct pattern is just the metadata decorator, letting the global guard do the work.
+
+**Why no ownership check on the review endpoints?**
+
+The existing instructor-facing `findOne(courseId, instructorId)` scopes queries by `instructorId` — only the owner can see their own course. The review endpoints are intentionally different: a moderator must be able to see *any* pending course, regardless of who owns it. `findOneForReview()` omits the ownership filter and instead relies on the `@RequirePermission('approve:courses')` guard to ensure only authorised users can call it.
+
+---
+
+#### Service additions — `courses.service.ts`
+
+**`findPending()`**
+
+```typescript
+async findPending(): Promise<Course[]> {
+    return this.courseRepo.find({
+        where: { status: CourseStatus.PENDING },
+        relations: ['instructor', 'category'],
+        order: { updated_at: 'ASC' },
+    });
+}
+```
+
+This is the simplest query in the service. All pending courses are returned, ordered oldest-first (`updated_at: 'ASC'`) so the moderator works through the queue in submission order. The `instructor` relation is loaded so the review list can display the instructor's name and email without a second API call.
+
+**`findOneForReview(courseId)`**
+
+```typescript
+async findOneForReview(courseId: string): Promise<Course> {
+    const course = await this.courseRepo.findOne({
+        where: { course_id: courseId },
+        relations: ['instructor', 'category'],
+    });
+    if (!course) throw new NotFoundException('Course not found');
+    return course;
+}
+```
+
+No `instructorId` filter — the moderator can load any course. The `instructor` relation is loaded here (unlike `findOne()` for instructors) because the review page displays the instructor's name and email as part of the content being reviewed, and there is no risk of leaking it: the viewer already has the `approve:courses` permission.
+
+**`approveCourse(courseId)`**
+
+```typescript
+async approveCourse(courseId: string): Promise<Course> {
+    const course = await this.courseRepo.findOne({
+        where: { course_id: courseId },
+        relations: ['instructor'],
+    });
+    if (!course) throw new NotFoundException('Course not found');
+    if (course.status !== CourseStatus.PENDING) {
+        throw new BadRequestException('Only pending courses can be approved');
+    }
+
+    course.status = CourseStatus.PUBLISHED;
+    course.rejection_reason = null;        // clear any previous rejection reason
+    const saved = await this.courseRepo.save(course);
+
+    // fire-and-forget email to instructor
+    this.mailService
+        .sendCourseApprovedNotification(
+            course.instructor.email,
+            course.instructor.full_name,
+            course.title,
+        )
+        .catch(() => {});
+
+    return saved;
+}
+```
+
+The transition guard `status !== PENDING` prevents approving a course that was already published (double-approval) or that is still a draft. This keeps the state machine honest: only `PENDING` can transition to `PUBLISHED`.
+
+The instructor relation is loaded in the same query as the course (`relations: ['instructor']`). Unlike `submitForReview()` which deliberately did a second query to avoid attaching the instructor to the response, here the course object is *not* sent to the instructor — only the email body is. The saved result does not include the instructor in its serialised response (because `approveCourse` is not the instructor-facing endpoint), so loading the relation inline is fine.
+
+**`rejectCourse(courseId, dto)`**
+
+```typescript
+async rejectCourse(courseId: string, dto: RejectCourseDto): Promise<Course> {
+    const course = await this.courseRepo.findOne({
+        where: { course_id: courseId },
+        relations: ['instructor'],
+    });
+    if (!course) throw new NotFoundException('Course not found');
+    if (course.status !== CourseStatus.PENDING) {
+        throw new BadRequestException('Only pending courses can be rejected');
+    }
+
+    course.status = CourseStatus.REJECTED;
+    course.rejection_reason = dto.reason;  // persist the reason for the instructor to see
+    const saved = await this.courseRepo.save(course);
+
+    // fire-and-forget email to instructor
+    this.mailService
+        .sendCourseRejectedNotification(
+            course.instructor.email,
+            course.instructor.full_name,
+            course.title,
+            dto.reason,
+        )
+        .catch(() => {});
+
+    return saved;
+}
+```
+
+The structure mirrors `approveCourse` exactly, just with different target state and the `reason` argument flowing through. The `dto.reason` is stored on the entity and also passed to the email method — both are needed because the instructor might not check email immediately and will need the reason visible in their dashboard.
+
+---
+
+#### Mail Service additions — `mail.service.ts`
+
+```typescript
+async sendCourseApprovedNotification(
+    to: string,
+    instructorName: string,
+    courseTitle: string,
+): Promise<void> {
+    await this.transporter.sendMail({
+        from: this.config.get('MAIL_FROM'),
+        to,
+        subject: `Your course has been approved: ${courseTitle}`,
+        html: `
+<h2>Congratulations, ${instructorName}!</h2>
+<p>Your course <strong>${courseTitle}</strong> has been approved and is now published on Betazoid.</p>`,
+    });
+}
+
+async sendCourseRejectedNotification(
+    to: string,
+    instructorName: string,
+    courseTitle: string,
+    reason: string,
+): Promise<void> {
+    await this.transporter.sendMail({
+        from: this.config.get('MAIL_FROM'),
+        to,
+        subject: `Your course requires changes: ${courseTitle}`,
+        html: `
+<h2>Hi ${instructorName},</h2>
+<p>Your course <strong>${courseTitle}</strong> was not approved at this time.</p>
+<p><strong>Reason:</strong> ${reason}</p>
+<p>You can edit your course and resubmit it for review.</p>`,
+    });
+}
+```
+
+Both methods send directly to the instructor's email address — the `to` parameter. This is the email stored on the `User` entity at registration (the same address used for the initial welcome email in Sprint 1). It is guaranteed to be set because the `instructor` relation is loaded before these methods are called.
+
+---
+
+### 4.3 Frontend — Two New Pages
+
+#### Pending queue — `/admin/courses/pending`
+
+The page (`frontend/src/app/admin/courses/pending/page.tsx`) gives a moderator a list of all courses awaiting review. It calls `GET /courses/pending`, which the global `PermissionsGuard` enforces — a user without `approve:courses` receives a `403` and the page shows an error message.
+
+```typescript
+const { data: courses, isLoading, isError } = useQuery<PendingCourse[]>({
+    queryKey: ['pending-courses'],
+    queryFn: async () => {
+        const { data } = await api.get('/courses/pending');
+        return data;
+    },
+    enabled: !!accessToken,
+});
+```
+
+Each item in the list links to the review page:
+
+```tsx
+<Button variant="outline" size="sm" asChild>
+    <Link href={`/admin/courses/${course.course_id}/review`}>Review</Link>
+</Button>
+```
+
+After the moderator approves or rejects on the review page, they are redirected back here, and the `pending-courses` query is invalidated so the reviewed course disappears from the list.
+
+---
+
+#### Review page — `/admin/courses/[id]/review`
+
+The page (`frontend/src/app/admin/courses/[id]/review/page.tsx`) loads the full course via `GET /courses/:id/review` and presents all its fields for the moderator to evaluate.
+
+**Approve flow — two-step confirmation:**
+
+```typescript
+const [confirmApprove, setConfirmApprove] = useState(false);
+
+const approveMutation = useMutation({
+    mutationFn: () => api.post(`/courses/${courseId}/approve`),
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['pending-courses'] });
+        router.push('/admin/courses/pending');  // return to the queue
+    },
+});
+```
+
+The moderator clicks "Approve", which sets `confirmApprove = true` and shows a confirmation prompt. Clicking "Confirm Approve" fires the mutation. On success, the pending queue cache is invalidated and the router navigates back to the list.
+
+**Reject flow — inline form:**
+
+Rejection requires a reason, so the UI shows a form rather than just a confirmation prompt:
+
+```typescript
+const [showRejectForm, setShowRejectForm] = useState(false);
+
+const {
+    register,
+    handleSubmit,
+    formState: { errors },
+} = useForm<RejectFormData>({ resolver: zodResolver(rejectSchema) });
+
+const rejectMutation = useMutation({
+    mutationFn: (data: RejectFormData) => api.post(`/courses/${courseId}/reject`, data),
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['pending-courses'] });
+        router.push('/admin/courses/pending');
+    },
+});
+```
+
+The Zod schema enforces a non-empty reason on the client side before even calling the API:
+
+```typescript
+const rejectSchema = z.object({
+    reason: z.string().min(1, 'Rejection reason is required'),
+});
+```
+
+This is a mirror of the backend's `@IsNotEmpty()` on `RejectCourseDto`. The client-side validation means the instructor sees a clear error message immediately rather than waiting for a round-trip API call.
+
+**Guard against stale status:**
+
+If a moderator navigates to a review page for a course that was already approved or rejected by a colleague:
+
+```tsx
+{course?.status !== 'pending' ? (
+    <div className="space-y-2">
+        <p className="text-sm text-muted-foreground">
+            This course is no longer pending (status: <span className="capitalize">{course?.status}</span>).
+        </p>
+        <Button variant="outline" asChild>
+            <Link href="/admin/courses/pending">Back to queue</Link>
+        </Button>
+    </div>
+) : (
+    /* approve/reject UI */
+)}
+```
+
+The approve and reject buttons only render when `status === 'pending'`. If the status is anything else, the moderator sees an informational message. The backend also enforces this — `approveCourse` and `rejectCourse` both throw `BadRequestException` if the course is not pending — so this is defence in depth.
+
+---
+
+#### Instructor list — `/courses` — updated for rejection
+
+Two changes were made to the instructor's course list page to support the post-rejection workflow:
+
+**1. Show rejection reason:**
+
+```tsx
+{course.status === 'rejected' && course.rejection_reason && (
+    <span className="text-xs text-destructive">
+        Rejected: {course.rejection_reason}
+    </span>
+)}
+```
+
+The reason is displayed inline under the course title, in the destructive (red) colour to draw attention. The instructor does not need to open the course to find out why it was rejected.
+
+**2. Show Edit button for rejected courses:**
+
+```tsx
+{(course.status === 'draft' || course.status === 'rejected') && (
+    <Button variant="outline" size="sm" asChild>
+        <Link href={`/courses/${course.course_id}/edit`}>Edit</Link>
+    </Button>
+)}
+```
+
+Previously, Edit was only shown for `draft`. Now `rejected` also shows the button, enabling the instructor to click straight from the rejection reason to the edit form.
+
+The edit page (`/courses/[id]/edit`) itself also displays the rejection reason at the top of the form when status is `rejected`:
+
+```tsx
+{course?.status === 'rejected' && course.rejection_reason && (
+    <div className="mb-4 space-y-1">
+        <p className="text-sm font-medium text-destructive">Rejected by reviewer</p>
+        <p className="text-sm text-destructive">{course.rejection_reason}</p>
+        <p className="text-sm text-muted-foreground">
+            Fix the issues below and resubmit for review.
+        </p>
+    </div>
+)}
+```
+
+This ensures the instructor has the rejection context visible while they make edits, without needing to navigate back to the list.
+
+---
+
+### 4.4 Unit Tests — `courses.service.spec.ts`
+
+Tests for `approveCourse` and `rejectCourse` follow the same mocking pattern as the existing `submitForReview` tests. The `mockMailService` factory was extended with the two new methods:
+
+```typescript
+const mockMailService = () => ({
+    sendCourseSubmittedNotification: jest.fn().mockResolvedValue(undefined),
+    sendCourseApprovedNotification: jest.fn().mockResolvedValue(undefined),
+    sendCourseRejectedNotification: jest.fn().mockResolvedValue(undefined),
+});
+```
+
+And `baseCourse()` was updated to include the new `rejection_reason` field (and to add `email` to the instructor fixture, since the approve/reject emails need it):
+
+```typescript
+const baseCourse = (): Course => ({
+    // ...
+    rejection_reason: null,
+    instructor: { user_id: 'instructor-uuid-1', full_name: 'Jane Doe', email: 'jane@example.com' } as any,
+    // ...
+});
+```
+
+**Key test cases for `approveCourse`:**
+
+| Test | Setup | Expected |
+|---|---|---|
+| Happy path | `status: 'pending'` | `result.status === 'published'`; `rejection_reason === null`; `save()` called |
+| Email sent | `status: 'pending'` | `sendCourseApprovedNotification` called with instructor email, name, title |
+| Not pending | `status: 'draft'` | `BadRequestException` |
+| Already published | `status: 'published'` | `BadRequestException` |
+| Course not found | `findOne()` returns `null` | `NotFoundException` |
+
+**Key test cases for `rejectCourse`:**
+
+| Test | Setup | Expected |
+|---|---|---|
+| Happy path | `status: 'pending'`, `dto.reason = 'Content needs more detail'` | `result.status === 'rejected'`; `result.rejection_reason === dto.reason` |
+| Email sent | `status: 'pending'` | `sendCourseRejectedNotification` called with email, name, title, reason |
+| Not pending | `status: 'draft'` | `BadRequestException` |
+| Already rejected | `status: 'rejected'` | `BadRequestException` |
+| Course not found | `findOne()` returns `null` | `NotFoundException` |
+
+All 18 tests (7 original + 5 approve + 6 reject) pass after the changes.
+
+---
+
+### 4.5 Security & Design Notes
+
+**The `reject → edit → resubmit` cycle is fully supported without a new endpoint.**
+
+When an instructor edits a rejected course, the status stays `REJECTED` — editing does not change it. They call the same `POST /courses/:id/submit` endpoint from US-13. That endpoint accepts `REJECTED` as a valid source state (alongside `DRAFT`), so no new "resubmit" endpoint was needed. The state machine handles the cycle naturally.
+
+**Why the tsconfig needed a `types` fix.**
+
+The existing `tsconfig.json` had no `types` array, so TypeScript inferred types from everything in `node_modules/@types/`. However, the IDE (VS Code) was not discovering `@types/jest` automatically, causing `jest`, `describe`, `it`, and `expect` to appear as unknown names. Adding `"types": ["node", "jest"]` explicitly tells both the compiler and the IDE where to look. This did not break the runtime — Jest itself uses `ts-jest` which was already finding `@types/jest` via the module resolver.
+
+**Moderator sees the instructor's email — is that a risk?**
+
+The `findOneForReview()` endpoint loads the `instructor` relation including `email`. This information is shown on the review page. Since only users with `approve:courses` can reach this endpoint (enforced by the global `PermissionsGuard`), the exposure is intentional — a moderator needs to know who submitted the course. The instructor's `password_hash` and `refresh_token_hash` are in the same `User` entity but are excluded from JSON responses by TypeORM's serialisation (they are not selected because `findOneForReview` uses the default select, and TypeORM only serialises columns explicitly on the entity).
+
+---
+
+### 4.6 The Full Flow
+
+**Approve a pending course:**
+
+```
+Browser (moderator)        NestJS                         PostgreSQL         Mailtrap (SMTP)
+        |                     |                               |                    |
+        |-- GET               |                               |                    |
+        |   /courses/pending  |                               |                    |
+        |              JwtAuthGuard ✓                         |                    |
+        |              PermissionsGuard                        |                    |
+        |              (checks approve:courses in Redis/DB)   |                    |
+        |                     |--- SELECT FROM courses ------>|                    |
+        |                     |    WHERE status='pending'     |                    |
+        |                     |    JOIN instructor, category  |                    |
+        |                     |<-- [{ title, instructor, ...}]|                    |
+        |<-- 200 + list -------|                               |                    |
+        |                     |                               |                    |
+        |-- GET               |                               |                    |
+        |   /courses/id/review|                               |                    |
+        |              PermissionsGuard ✓                      |                    |
+        |                     |--- SELECT FROM courses ------>|                    |
+        |                     |    WHERE course_id = id       |                    |
+        |                     |    JOIN instructor, category  |                    |
+        |                     |<-- { full course detail } ----|                    |
+        |<-- 200 + course -----|                               |                    |
+        |                     |                               |                    |
+        |-- POST              |                               |                    |
+        |   /courses/id/approve                               |                    |
+        |              PermissionsGuard ✓                      |                    |
+        |                     |                               |                    |
+        |              CoursesService.approveCourse()         |                    |
+        |                     |--- SELECT FROM courses ------>|                    |
+        |                     |    JOIN instructor            |                    |
+        |                     |<-- { status:'pending', ... }--|                    |
+        |              status === PENDING ✓                    |                    |
+        |              course.status = 'published'            |                    |
+        |              course.rejection_reason = null         |                    |
+        |                     |--- UPDATE courses ----------->|                    |
+        |                     |    SET status='published',    |                    |
+        |                     |        rejection_reason=NULL  |                    |
+        |                     |<-- { status:'published' } ----|                    |
+        |<-- 200 + course -----|                               |                    |
+        |   (router.push to   |  (fire-and-forget)            |                    |
+        |    pending list)     |------- SMTP sendMail -------------------------------->|
+        |                     |        to: jane@example.com                           |
+        |                     |        subject: "Your course has been approved: ..."   |
+        |                     |<------ 250 OK ----------------------------------------|
+```
+
+**Reject a pending course:**
+
+```
+Browser (moderator)        NestJS                         PostgreSQL         Mailtrap (SMTP)
+        |                     |                               |                    |
+        |-- POST              |                               |                    |
+        |   /courses/id/reject|                               |                    |
+        |   { reason: "..." } |                               |                    |
+        |              ValidationPipe                         |                    |
+        |              (RejectCourseDto: reason not empty)    |                    |
+        |              PermissionsGuard ✓                      |                    |
+        |                     |                               |                    |
+        |              CoursesService.rejectCourse()          |                    |
+        |                     |--- SELECT FROM courses ------>|                    |
+        |                     |    JOIN instructor            |                    |
+        |                     |<-- { status:'pending', ... }--|                    |
+        |              status === PENDING ✓                    |                    |
+        |              course.status = 'rejected'             |                    |
+        |              course.rejection_reason = dto.reason   |                    |
+        |                     |--- UPDATE courses ----------->|                    |
+        |                     |    SET status='rejected',     |                    |
+        |                     |        rejection_reason='...' |                    |
+        |                     |<-- { status:'rejected' } -----|                    |
+        |<-- 200 + course -----|                               |                    |
+        |                     |------- SMTP sendMail -------------------------------->|
+        |                     |        to: jane@example.com                           |
+        |                     |        subject: "Your course requires changes: ..."   |
+        |                     |        body includes reason                            |
+        |                     |<------ 250 OK ----------------------------------------|
+
+Browser (instructor — later)
+        |
+        |-- GET /courses      (sees rejection reason in the list)
+        |-- GET /courses/id/edit  (sees reason at top of edit form)
+        |-- (edits the course)
+        |-- POST /courses/id/submit   (re-submits → status back to PENDING)
+```

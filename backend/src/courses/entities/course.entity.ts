@@ -55,6 +55,9 @@ export class Course {
     })
     status!: CourseStatus;
 
+    @Column({ type: 'text', nullable: true })
+    rejection_reason!: string | null;
+
     @ManyToOne(() => User, { onDelete: 'CASCADE' })
     @JoinColumn({ name: 'instructor_id' })
     instructor!: User;

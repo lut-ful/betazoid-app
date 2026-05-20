@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { Course, CourseStatus } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
+import { RejectCourseDto } from './dto/reject-course.dto';
 import { Category } from '../categories/entities/category.entity';
 import { MailService } from '../mail/mail.service';
 
@@ -133,6 +134,74 @@ export class CoursesService {
                 )
                 .catch(() => {});
         }
+
+        return saved;
+    }
+
+    async findPending(): Promise<Course[]> {
+        return this.courseRepo.find({
+            where: { status: CourseStatus.PENDING },
+            relations: ['instructor', 'category'],
+            order: { updated_at: 'ASC' },
+        });
+    }
+
+    async findOneForReview(courseId: string): Promise<Course> {
+        const course = await this.courseRepo.findOne({
+            where: { course_id: courseId },
+            relations: ['instructor', 'category'],
+        });
+        if (!course) throw new NotFoundException('Course not found');
+        return course;
+    }
+
+    async approveCourse(courseId: string): Promise<Course> {
+        const course = await this.courseRepo.findOne({
+            where: { course_id: courseId },
+            relations: ['instructor'],
+        });
+        if (!course) throw new NotFoundException('Course not found');
+        if (course.status !== CourseStatus.PENDING) {
+            throw new BadRequestException('Only pending courses can be approved');
+        }
+
+        course.status = CourseStatus.PUBLISHED;
+        course.rejection_reason = null;
+        const saved = await this.courseRepo.save(course);
+
+        this.mailService
+            .sendCourseApprovedNotification(
+                course.instructor.email,
+                course.instructor.full_name,
+                course.title,
+            )
+            .catch(() => {});
+
+        return saved;
+    }
+
+    async rejectCourse(courseId: string, dto: RejectCourseDto): Promise<Course> {
+        const course = await this.courseRepo.findOne({
+            where: { course_id: courseId },
+            relations: ['instructor'],
+        });
+        if (!course) throw new NotFoundException('Course not found');
+        if (course.status !== CourseStatus.PENDING) {
+            throw new BadRequestException('Only pending courses can be rejected');
+        }
+
+        course.status = CourseStatus.REJECTED;
+        course.rejection_reason = dto.reason;
+        const saved = await this.courseRepo.save(course);
+
+        this.mailService
+            .sendCourseRejectedNotification(
+                course.instructor.email,
+                course.instructor.full_name,
+                course.title,
+                dto.reason,
+            )
+            .catch(() => {});
 
         return saved;
     }

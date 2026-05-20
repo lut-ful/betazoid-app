@@ -6,6 +6,7 @@ import { CoursesService } from './courses.service';
 import { Course, CourseStatus, CourseLevel } from './entities/course.entity';
 import { Category } from '../categories/entities/category.entity';
 import { MailService } from '../mail/mail.service';
+import { RejectCourseDto } from './dto/reject-course.dto';
 
 const mockCourseRepo = () => ({
     create: jest.fn(),
@@ -21,6 +22,8 @@ const mockCategoryRepo = () => ({
 
 const mockMailService = () => ({
     sendCourseSubmittedNotification: jest.fn().mockResolvedValue(undefined),
+    sendCourseApprovedNotification: jest.fn().mockResolvedValue(undefined),
+    sendCourseRejectedNotification: jest.fn().mockResolvedValue(undefined),
 });
 
 const mockConfigService = () => ({
@@ -36,7 +39,8 @@ const baseCourse = (): Course => ({
     language: 'English',
     level: CourseLevel.BEGINNER,
     status: CourseStatus.DRAFT,
-    instructor: { user_id: 'instructor-uuid-1', full_name: 'Jane Doe' } as any,
+    rejection_reason: null,
+    instructor: { user_id: 'instructor-uuid-1', full_name: 'Jane Doe', email: 'jane@example.com' } as any,
     category: null,
     created_at: new Date(),
     updated_at: new Date(),
@@ -166,5 +170,168 @@ describe('CoursesService — submitForReview', () => {
         await expect(
             service.submitForReview('course-uuid-1', 'other-instructor-uuid'),
         ).rejects.toBeInstanceOf(ForbiddenException);
+    });
+});
+
+describe('CoursesService — approveCourse', () => {
+    let service: CoursesService;
+    let courseRepo: ReturnType<typeof mockCourseRepo>;
+    let mailService: ReturnType<typeof mockMailService>;
+
+    beforeEach(async () => {
+        const module: TestingModule = await Test.createTestingModule({
+            providers: [
+                CoursesService,
+                { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
+                { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: MailService, useFactory: mockMailService },
+                { provide: ConfigService, useFactory: mockConfigService },
+            ],
+        }).compile();
+
+        service = module.get(CoursesService);
+        courseRepo = module.get(getRepositoryToken(Course));
+        mailService = module.get(MailService);
+    });
+
+    it('transitions a PENDING course to PUBLISHED', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.PENDING };
+        courseRepo.findOne.mockResolvedValue(course);
+        courseRepo.save.mockResolvedValue({ ...course, status: CourseStatus.PUBLISHED, rejection_reason: null });
+
+        const result = await service.approveCourse('course-uuid-1');
+
+        expect(result.status).toBe(CourseStatus.PUBLISHED);
+        expect(courseRepo.save).toHaveBeenCalledWith(
+            expect.objectContaining({ status: CourseStatus.PUBLISHED, rejection_reason: null }),
+        );
+    });
+
+    it('sends approval email to instructor', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.PENDING };
+        courseRepo.findOne.mockResolvedValue(course);
+        courseRepo.save.mockResolvedValue({ ...course, status: CourseStatus.PUBLISHED });
+
+        await service.approveCourse('course-uuid-1');
+        await new Promise(process.nextTick);
+
+        expect(mailService.sendCourseApprovedNotification).toHaveBeenCalledWith(
+            'jane@example.com',
+            'Jane Doe',
+            'Test Course',
+        );
+    });
+
+    it('throws BadRequestException when course is not PENDING', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.DRAFT };
+        courseRepo.findOne.mockResolvedValue(course);
+
+        await expect(service.approveCourse('course-uuid-1')).rejects.toBeInstanceOf(
+            BadRequestException,
+        );
+    });
+
+    it('throws BadRequestException when course is already PUBLISHED', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.PUBLISHED };
+        courseRepo.findOne.mockResolvedValue(course);
+
+        await expect(service.approveCourse('course-uuid-1')).rejects.toBeInstanceOf(
+            BadRequestException,
+        );
+    });
+
+    it('throws NotFoundException when course does not exist', async () => {
+        courseRepo.findOne.mockResolvedValue(null);
+
+        await expect(service.approveCourse('nonexistent-id')).rejects.toBeInstanceOf(
+            NotFoundException,
+        );
+    });
+});
+
+describe('CoursesService — rejectCourse', () => {
+    let service: CoursesService;
+    let courseRepo: ReturnType<typeof mockCourseRepo>;
+    let mailService: ReturnType<typeof mockMailService>;
+
+    const rejectDto: RejectCourseDto = { reason: 'Content needs more detail' };
+
+    beforeEach(async () => {
+        const module: TestingModule = await Test.createTestingModule({
+            providers: [
+                CoursesService,
+                { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
+                { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: MailService, useFactory: mockMailService },
+                { provide: ConfigService, useFactory: mockConfigService },
+            ],
+        }).compile();
+
+        service = module.get(CoursesService);
+        courseRepo = module.get(getRepositoryToken(Course));
+        mailService = module.get(MailService);
+    });
+
+    it('transitions a PENDING course to REJECTED and stores the reason', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.PENDING };
+        courseRepo.findOne.mockResolvedValue(course);
+        courseRepo.save.mockResolvedValue({
+            ...course,
+            status: CourseStatus.REJECTED,
+            rejection_reason: rejectDto.reason,
+        });
+
+        const result = await service.rejectCourse('course-uuid-1', rejectDto);
+
+        expect(result.status).toBe(CourseStatus.REJECTED);
+        expect(result.rejection_reason).toBe(rejectDto.reason);
+        expect(courseRepo.save).toHaveBeenCalledWith(
+            expect.objectContaining({
+                status: CourseStatus.REJECTED,
+                rejection_reason: rejectDto.reason,
+            }),
+        );
+    });
+
+    it('sends rejection email to instructor with the reason', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.PENDING };
+        courseRepo.findOne.mockResolvedValue(course);
+        courseRepo.save.mockResolvedValue({ ...course, status: CourseStatus.REJECTED });
+
+        await service.rejectCourse('course-uuid-1', rejectDto);
+        await new Promise(process.nextTick);
+
+        expect(mailService.sendCourseRejectedNotification).toHaveBeenCalledWith(
+            'jane@example.com',
+            'Jane Doe',
+            'Test Course',
+            rejectDto.reason,
+        );
+    });
+
+    it('throws BadRequestException when course is not PENDING', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.DRAFT };
+        courseRepo.findOne.mockResolvedValue(course);
+
+        await expect(service.rejectCourse('course-uuid-1', rejectDto)).rejects.toBeInstanceOf(
+            BadRequestException,
+        );
+    });
+
+    it('throws BadRequestException when course is already REJECTED', async () => {
+        const course = { ...baseCourse(), status: CourseStatus.REJECTED };
+        courseRepo.findOne.mockResolvedValue(course);
+
+        await expect(service.rejectCourse('course-uuid-1', rejectDto)).rejects.toBeInstanceOf(
+            BadRequestException,
+        );
+    });
+
+    it('throws NotFoundException when course does not exist', async () => {
+        courseRepo.findOne.mockResolvedValue(null);
+
+        await expect(service.rejectCourse('nonexistent-id', rejectDto)).rejects.toBeInstanceOf(
+            NotFoundException,
+        );
     });
 });

@@ -37,6 +37,7 @@ interface Course {
     language: string;
     level: 'beginner' | 'intermediate' | 'advanced';
     status: string;
+    rejection_reason: string | null;
     category: { category_id: string; name: string } | null;
 }
 
@@ -150,6 +151,15 @@ export default function EditCoursePage() {
                     <CardTitle>Edit Course</CardTitle>
                 </CardHeader>
                 <CardContent>
+                    {course?.status === 'rejected' && course.rejection_reason && (
+                        <div className="mb-4 space-y-1">
+                            <p className="text-sm font-medium text-destructive">Rejected by reviewer</p>
+                            <p className="text-sm text-destructive">{course.rejection_reason}</p>
+                            <p className="text-sm text-muted-foreground">
+                                Fix the issues below and resubmit for review.
+                            </p>
+                        </div>
+                    )}
                     <form
                         onSubmit={handleSubmit((data) => mutation.mutate(data))}
                         className="space-y-4"
