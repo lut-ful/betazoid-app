@@ -1,10 +1,13 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { ILike, In, Repository } from 'typeorm';
 import { Permission } from '../permissions/entities/permission.entity';
+import { User } from '../users/entities/user.entity';
 import { AssignPermissionsDto } from './dto/assign-permissions.dto';
+import { AssignRolesDto } from './dto/assign-roles.dto';
 import { CreateRoleDto } from './dto/create-role.dto';
 import { Role } from './entities/role.entity';
+import { UserRole } from './entities/user-role.entity';
 
 @Injectable()
 export class RolesService {
@@ -13,6 +16,10 @@ export class RolesService {
         private readonly roleRepo: Repository<Role>,
         @InjectRepository(Permission)
         private readonly permissionRepo: Repository<Permission>,
+        @InjectRepository(User)
+        private readonly userRepo: Repository<User>,
+        @InjectRepository(UserRole)
+        private readonly userRoleRepo: Repository<UserRole>,
     ) {}
 
     async create(dto: CreateRoleDto): Promise<Role> {
@@ -52,5 +59,60 @@ export class RolesService {
                 : [];
         role.permissions = permissions;
         return this.roleRepo.save(role);
+    }
+
+    async searchUsers(query: string): Promise<Partial<User>[]> {
+        const where = query
+            ? [{ full_name: ILike(`%${query}%`) }, { email: ILike(`%${query}%`) }]
+            : undefined;
+
+        return this.userRepo.find({
+            select: {
+                user_id: true,
+                full_name: true,
+                email: true,
+                gmail: true,
+                bio: true,
+                profile_photo_url: true,
+                is_email_verified: true,
+                created_at: true,
+                updated_at: true,
+                userRoles: {
+                    user_role_id: true,
+                    created_at: true,
+                    role: { role_id: true, name: true },
+                },
+            },
+            where,
+            relations: { userRoles: { role: true } },
+            order: { full_name: 'ASC' },
+            take: 50,
+        });
+    }
+
+    async assignRolesToUser(userId: string, dto: AssignRolesDto): Promise<void> {
+        const user = await this.userRepo.findOne({ where: { user_id: userId } });
+        if (!user) throw new NotFoundException('User not found');
+
+        const roles =
+            dto.roleIds.length > 0
+                ? await this.roleRepo.findBy({ role_id: In(dto.roleIds) })
+                : [];
+
+        if (dto.roleIds.length > 0 && roles.length !== dto.roleIds.length) {
+            throw new NotFoundException('One or more roles not found');
+        }
+
+        await this.userRoleRepo
+            .createQueryBuilder()
+            .delete()
+            .from(UserRole)
+            .where('user_id = :userId', { userId })
+            .execute();
+
+        if (roles.length > 0) {
+            const userRoles = roles.map((role) => this.userRoleRepo.create({ user, role }));
+            await this.userRoleRepo.save(userRoles);
+        }
     }
 }
