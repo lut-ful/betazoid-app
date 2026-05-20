@@ -44,4 +44,10 @@ export class CoursesController {
     ) {
         return this.coursesService.update(id, dto, req.user.userId);
     }
+
+    @Post(':id/submit')
+    @HttpCode(HttpStatus.OK)
+    submit(@Param('id') id: string, @Request() req: any) {
+        return this.coursesService.submitForReview(id, req.user.userId);
+    }
 }

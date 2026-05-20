@@ -1,14 +1,17 @@
 import {
+    BadRequestException,
     ForbiddenException,
     Injectable,
     NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
 import { Course, CourseStatus } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { Category } from '../categories/entities/category.entity';
+import { MailService } from '../mail/mail.service';
 
 @Injectable()
 export class CoursesService {
@@ -17,6 +20,8 @@ export class CoursesService {
         private readonly courseRepo: Repository<Course>,
         @InjectRepository(Category)
         private readonly categoryRepo: Repository<Category>,
+        private readonly mailService: MailService,
+        private readonly config: ConfigService,
     ) {}
 
     async create(dto: CreateCourseDto, instructorId: string): Promise<Course> {
@@ -99,5 +104,36 @@ export class CoursesService {
         if (dto.level !== undefined) course.level = dto.level;
 
         return this.courseRepo.save(course);
+    }
+
+    async submitForReview(courseId: string, instructorId: string): Promise<Course> {
+        const course = await this.findOne(courseId, instructorId);
+
+        if (course.status !== CourseStatus.DRAFT && course.status !== CourseStatus.REJECTED) {
+            throw new BadRequestException(
+                'Only draft or rejected courses can be submitted for review',
+            );
+        }
+
+        course.status = CourseStatus.PENDING;
+        const saved = await this.courseRepo.save(course);
+
+        const adminEmail = this.config.get<string>('ADMIN_EMAIL');
+        if (adminEmail) {
+            const withInstructor = await this.courseRepo.findOne({
+                where: { course_id: courseId },
+                relations: ['instructor'],
+            });
+            this.mailService
+                .sendCourseSubmittedNotification(
+                    adminEmail,
+                    withInstructor?.instructor.full_name ?? 'Instructor',
+                    course.title,
+                    courseId,
+                )
+                .catch(() => {});
+        }
+
+        return saved;
     }
 }

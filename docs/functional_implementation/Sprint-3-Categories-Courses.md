@@ -11,6 +11,7 @@
 
 1. [US-11 — Category Management](#1-us-11--category-management)
 2. [US-12 — Create Course](#2-us-12--create-course)
+3. [US-13 — Submit Course for Review](#3-us-13--submit-course-for-review)
 
 ---
 
@@ -948,4 +949,432 @@ Browser (instructor)      NestJS                         PostgreSQL
         |              course.status === PENDING              |
         |              → throw ForbiddenException             |
         |<-- 403 "Course cannot be edited while pending" -----|
+```
+
+---
+
+## 3. US-13 — Submit Course for Review
+
+> *As an Instructor, I want to submit my course for review so that it can be published on the platform.*
+
+### Acceptance Criteria
+- Course status changes from Draft to Pending on submission
+- Admin/Moderator receives a notification of the pending course
+- Instructor cannot edit the course while it is Pending
+
+---
+
+### 3.1 Theory — State Machines and Guarded Transitions
+
+A **state machine** is a model where an object can be in exactly one of a finite set of states, and only certain transitions between states are allowed. You encountered the concept in US-12 when the course lifecycle was introduced:
+
+```
+DRAFT ──[submit]──→ PENDING ──[approve]──→ PUBLISHED
+                       │
+                    [reject]
+                       ↓
+                   REJECTED ──[re-submit]──→ PENDING
+```
+
+Each arrow is a *transition*. Not every transition is legal. An instructor cannot move a course directly from `DRAFT` to `PUBLISHED` — they must go through `PENDING` so the admin has a chance to review. A course that is already `PENDING` cannot be submitted again.
+
+**Why implement this in the service layer, not the database?**
+
+The database stores the current state (`status` column) and enforces valid enum values via a `CHECK` constraint. But the *transition rules* — which states can move to which — belong in the service layer because they require business context: Who is requesting the transition? What is the current state? Should an email be sent?
+
+The rule in `submitForReview` is:
+
+```
+allowed source states: DRAFT, REJECTED
+target state:          PENDING
+everything else:       → 400 BadRequestException
+```
+
+This single guard enforces the state machine at the API boundary. No matter how many times a client calls `POST /courses/:id/submit`, the course can only reach `PENDING` from valid source states.
+
+---
+
+**Why fire-and-forget for the email notification?**
+
+A transactional write (status → PENDING) and a network call (SMTP email) should not be coupled together in a way where either can block or fail the other.
+
+Consider the alternative:
+
+```
+// ❌ Coupled — email failure rolls back the status update
+await this.courseRepo.save(course);    // status = PENDING in DB
+await this.mailService.send(...);      // SMTP server is down → throws
+// → the whole request fails with 500, but DB was already written!
+// Now status is PENDING in the DB but the request returned an error.
+```
+
+That is even worse than no email: the database and the API response are now inconsistent. The instructor will think submission failed and try again, but the course is already `PENDING`.
+
+The correct model is:
+
+```
+// ✅ Decoupled — email failure does not affect the HTTP response
+await this.courseRepo.save(course);       // status = PENDING in DB ← commit this first
+const saved = course;                     // capture the saved result
+
+// fire and forget — start the promise, do not await it
+this.mailService.send(...).catch(() => {}); // silent failure: log in prod, ignore here
+return saved;                             // respond immediately with the updated course
+```
+
+The `.catch(() => {})` suppresses any unhandled promise rejection (which would crash the Node.js process in some configurations). In production you would log the failure to a monitoring service instead of discarding it. For now, a silent catch is appropriate.
+
+**Why not use BullMQ for the email?**
+
+BullMQ is introduced in Sprint 5 for the YouTube playlist grant/revoke, which has a 60-second SLA. Email delivery has no SLA in this user story — the admin just needs to eventually receive a notification. A fire-and-forget call to the existing Nodemailer transporter is simpler and sufficient. BullMQ adds Redis dependency and job queue overhead that is not justified here.
+
+---
+
+### 3.2 Backend — The Submit Endpoint
+
+#### Route
+
+```
+POST /api/v1/courses/:id/submit
+Authorization: Bearer <access_token>
+Body: (empty — no request body needed)
+
+Success → 200 OK + updated Course object (status: "pending")
+Errors:
+  404 → course not found
+  403 → course belongs to a different instructor
+  400 → course is not in a submittable state (already pending or published)
+```
+
+The endpoint uses `POST` (not `PATCH`) because it triggers a state transition, not a field update. Using an action-based URL (`/submit`) is a common REST pattern for operations that don't fit neatly into CRUD. `@HttpCode(HttpStatus.OK)` is set explicitly because NestJS defaults `POST` handlers to `201 Created` — but this is not creating a resource, it is performing an action on an existing one.
+
+---
+
+#### Service — `submitForReview(courseId, instructorId)`
+
+```typescript
+async submitForReview(courseId: string, instructorId: string): Promise<Course> {
+    // Step 1: ownership check (reuses findOne which handles 404 + 403)
+    const course = await this.findOne(courseId, instructorId);
+
+    // Step 2: guard the transition — only DRAFT or REJECTED can move to PENDING
+    if (course.status !== CourseStatus.DRAFT && course.status !== CourseStatus.REJECTED) {
+        throw new BadRequestException(
+            'Only draft or rejected courses can be submitted for review',
+        );
+    }
+
+    // Step 3: perform the transition and persist
+    course.status = CourseStatus.PENDING;
+    const saved = await this.courseRepo.save(course);
+
+    // Step 4: fire-and-forget admin email
+    const adminEmail = this.config.get<string>('ADMIN_EMAIL');
+    if (adminEmail) {
+        // separate query to load the instructor name without exposing it in the
+        // main findOne result (which deliberately omits the instructor relation)
+        const withInstructor = await this.courseRepo.findOne({
+            where: { course_id: courseId },
+            relations: ['instructor'],
+        });
+        this.mailService
+            .sendCourseSubmittedNotification(
+                adminEmail,
+                withInstructor?.instructor.full_name ?? 'Instructor',
+                course.title,
+                courseId,
+            )
+            .catch(() => {});   // swallow email errors — not a reason to fail the request
+    }
+
+    return saved;
+}
+```
+
+**Why a separate query to get the instructor name?**
+
+The `findOne()` helper deliberately omits `relations: ['instructor']` to avoid serialising the instructor's `password_hash` and `refresh_token_hash` in the API response (see US-12 Security Notes). But the email needs the instructor's `full_name` for a human-readable notification. Rather than changing `findOne()` and potentially leaking sensitive data, we do a second query scoped only to what we need: the instructor's name. This query is inside the fire-and-forget block, so its latency does not affect the HTTP response time.
+
+**Why support `REJECTED` as a valid source state?**
+
+US-14 (Approve or Reject) states: "Instructor can edit and resubmit a rejected course." A rejected course that has been edited is still `REJECTED` in the database — editing does not auto-reset the status. To resubmit, the instructor calls this same `POST /courses/:id/submit` endpoint. Handling both `DRAFT` and `REJECTED` here avoids needing a separate "resubmit" endpoint later.
+
+**Why is `ADMIN_EMAIL` a config var rather than a DB query?**
+
+Looking up all admin users from the database on every course submission would require joining `users → user_roles → roles → role_permissions → permissions` to find users with the right role. That is complex for a notification that does not need to be real-time. A single configurable email address (which could point to a shared inbox or a distribution list) is the simplest solution that satisfies the acceptance criteria. Per CLAUDE.md: "Email via Nodemailer/SendGrid is already in the stack — plan to use it."
+
+---
+
+#### Mail Service — `sendCourseSubmittedNotification()`
+
+```typescript
+async sendCourseSubmittedNotification(
+    adminEmail: string,
+    instructorName: string,
+    courseTitle: string,
+    courseId: string,
+): Promise<void> {
+    await this.transporter.sendMail({
+        from: this.config.get('MAIL_FROM'),
+        to: adminEmail,
+        subject: `Course submitted for review: ${courseTitle}`,
+        html: `
+<h2>New course pending review</h2>
+<p><strong>Course:</strong> ${courseTitle}</p>
+<p><strong>Instructor:</strong> ${instructorName}</p>
+<p><strong>Course ID:</strong> ${courseId}</p>
+<p>Please log in to review and approve or reject this course.</p>`,
+    });
+}
+```
+
+The method signature takes primitive values (`string`) rather than entity objects. This keeps `MailService` decoupled from domain entities — it is a pure communication utility that does not need to know what a `Course` or `User` looks like. The caller (`CoursesService`) is responsible for extracting the strings it needs.
+
+---
+
+#### Controller — `courses.controller.ts`
+
+```typescript
+@Post(':id/submit')
+@HttpCode(HttpStatus.OK)
+submit(@Param('id') id: string, @Request() req: any) {
+    return this.coursesService.submitForReview(id, req.user.userId);
+}
+```
+
+The route `:id/submit` sits under the same `@Controller('courses')` prefix, so the full path is `POST /api/v1/courses/:id/submit`. The class-level `@UseGuards(JwtAuthGuard)` covers this method automatically — no per-method guard needed.
+
+---
+
+#### Module — `courses.module.ts`
+
+```typescript
+@Module({
+    imports: [TypeOrmModule.forFeature([Course, Category]), MailModule],
+    //                                                       ^^^^^^^^^
+    //  MailModule exports MailService, making it injectable in CoursesService
+    controllers: [CoursesController],
+    providers: [CoursesService],
+    exports: [CoursesService],
+})
+export class CoursesModule {}
+```
+
+`MailModule` must be listed in `imports` so that `MailService` (which `MailModule` exports) is available for injection into `CoursesService`. Without this import, NestJS would throw a dependency resolution error at startup: `Nest can't resolve dependencies of CoursesService (?). Please make sure that the argument MailService at index [2] is available in the CoursesModule context`.
+
+`ConfigService` does **not** need to be added to `imports` here because `ConfigModule.forRoot({ isGlobal: true })` in `AppModule` registers `ConfigService` in the global DI container — it is available everywhere without a local import.
+
+---
+
+### 3.3 Frontend — Submit for Review on the Edit Page
+
+US-13 does not need a new page. The edit page (`/courses/[id]/edit`) already handles the `pending` state with a read-only view. US-13 adds a "Submit for Review" section at the bottom of the edit form — the action that moves the course from `DRAFT` (editable) into `PENDING` (read-only).
+
+**The new mutation:**
+
+```typescript
+const submitMutation = useMutation({
+    mutationFn: () => api.post(`/courses/${courseId}/submit`),
+    //                         no request body — the endpoint needs only the ID in the URL
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['my-courses'] });
+        queryClient.invalidateQueries({ queryKey: ['course', courseId] });
+        //                                          ^^^^^^^^^^^^^^^^
+        // invalidating both cache keys forces:
+        // 1. the course list page to re-fetch (status badge updates)
+        // 2. this page to re-fetch — the course query returns status:'pending'
+        //    which triggers the read-only view to render automatically
+        setConfirmSubmit(false);
+    },
+});
+```
+
+After `onSuccess` invalidates the `['course', courseId]` query, TanStack Query re-fetches the course. The response now has `status: 'pending'`. The edit page checks this at render time:
+
+```typescript
+if (course?.status === 'pending') {
+    return ( /* read-only view */ );
+}
+```
+
+So the transition from "editable form" to "locked read-only view" happens entirely through the cache invalidation → re-fetch → re-render cycle. No manual state manipulation needed.
+
+**Two-step confirmation UI:**
+
+Submitting for review is irreversible from the instructor's perspective (they cannot cancel it once submitted — only the admin can reject it). The two-step confirmation pattern from the frontend conventions communicates this weight without a full modal:
+
+```typescript
+const [confirmSubmit, setConfirmSubmit] = useState(false);
+
+// First click — show the confirmation panel
+{!confirmSubmit ? (
+    <Button variant="outline" onClick={() => setConfirmSubmit(true)}>
+        Submit for Review
+    </Button>
+) : (
+    // Second step — warning + Confirm / Cancel
+    <div className="space-y-2">
+        <p className="text-sm text-destructive">
+            Once submitted you cannot edit this course until the review is complete. Continue?
+        </p>
+        {submitMutation.isError && (
+            <p className="text-sm text-destructive">
+                {(submitMutation.error as any)?.response?.data?.message ?? 'Failed to submit course.'}
+            </p>
+        )}
+        <div className="flex gap-2">
+            <Button
+                disabled={submitMutation.isPending}
+                onClick={() => submitMutation.mutate()}
+            >
+                {submitMutation.isPending ? 'Submitting...' : 'Confirm Submit'}
+            </Button>
+            <Button variant="outline" onClick={() => setConfirmSubmit(false)}>
+                Cancel
+            </Button>
+        </div>
+    </div>
+)}
+```
+
+`confirmSubmit` is a `useState` boolean local to this component. Clicking "Submit for Review" sets it to `true`, revealing the confirmation panel. Clicking "Cancel" sets it back to `false`. Clicking "Confirm Submit" fires the mutation. If the mutation fails (e.g. course was already submitted in another browser tab), the error message from `submitMutation.error.response.data.message` is displayed inline.
+
+`submitMutation.mutate()` is called with no argument because `mutationFn` takes no parameters — the course ID is already in scope from the `useParams()` hook at the top of the component.
+
+---
+
+### 3.4 Unit Tests — `courses.service.spec.ts`
+
+The unit tests mock all external dependencies (database repository, `MailService`, `ConfigService`) using Jest's factory pattern. This means tests run without a database connection and without sending real emails.
+
+**Mocking pattern:**
+
+```typescript
+const mockCourseRepo = () => ({
+    create: jest.fn(),
+    save: jest.fn(),
+    find: jest.fn(),
+    findOne: jest.fn(),
+    exists: jest.fn(),
+});
+```
+
+Each mock factory returns a fresh object with `jest.fn()` on every method. By registering these via `useFactory` in the test module, NestJS's DI container injects the mock wherever the real implementation would go:
+
+```typescript
+{ provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
+{ provide: MailService,               useFactory: mockMailService  },
+{ provide: ConfigService,             useFactory: mockConfigService},
+```
+
+`getRepositoryToken(Course)` returns the DI token that `@InjectRepository(Course)` registers — this is how you mock TypeORM repositories in NestJS tests without instantiating a real DB connection.
+
+**Key test cases and what they assert:**
+
+| Test | `courseRepo.findOne` mock returns | Expected outcome |
+|---|---|---|
+| DRAFT → PENDING happy path | `{ status: 'draft' }` | `result.status === 'pending'`; `save()` called with PENDING |
+| REJECTED → PENDING | `{ status: 'rejected' }` | `result.status === 'pending'` |
+| Email sent | `{ status: 'draft' }` + ADMIN_EMAIL configured | `mailService.sendCourseSubmittedNotification` called once |
+| Email skipped | ADMIN_EMAIL = `undefined` | `mailService.sendCourseSubmittedNotification` NOT called |
+| Already PENDING | `{ status: 'pending' }` | `BadRequestException` thrown |
+| Already PUBLISHED | `{ status: 'published' }` | `BadRequestException` thrown |
+| Course not found | `exists()` returns `false` | `NotFoundException` thrown |
+| Wrong instructor | `exists()` returns `true`, `findOne()` returns `null` | `ForbiddenException` thrown |
+
+**The `process.nextTick` trick for fire-and-forget:**
+
+```typescript
+await service.submitForReview('course-uuid-1', 'instructor-uuid-1');
+
+// The fire-and-forget promise resolves in the next microtask cycle.
+// Awaiting process.nextTick lets it settle before the assertion runs.
+await new Promise(process.nextTick);
+
+expect(mailService.sendCourseSubmittedNotification).toHaveBeenCalledWith(...);
+```
+
+The email call is fire-and-forget (not `await`-ed in the service). The assertion runs synchronously after `submitForReview` returns — at that point the mail promise may not have been called yet. `await new Promise(process.nextTick)` yields control for one microtask cycle, giving the `.catch(() => {})` chain time to execute and the mock to record the call.
+
+---
+
+### 3.5 Security & Design Notes
+
+**The pending lock is enforced at two layers:**
+
+| Layer | Mechanism | What it catches |
+|---|---|---|
+| Frontend | `course?.status === 'pending'` → render read-only view | Normal user — they can't even see the form |
+| Backend (`update()`) | `if (course.status === PENDING) throw ForbiddenException` | API client that bypasses the UI |
+
+The frontend lock is a UX convenience. The backend lock is the security boundary. Any direct API call (curl, Postman, malicious script) to `PATCH /courses/:id` while the course is pending will receive a `403`.
+
+**ADMIN_EMAIL is a single address — intentional trade-off:**
+
+Querying the database for all users with admin permissions on every submission would require a multi-table join across `users → user_roles → roles → role_permissions → permissions`. That complexity is not justified for a notification. Using a single `ADMIN_EMAIL` env var means the email can point to a shared inbox (e.g. `review@betazoid.com`) that multiple admins monitor. This is the pragmatic choice for an early-stage platform.
+
+**What about `PUBLISHED` courses that are re-submitted?**
+
+An instructor cannot submit a `PUBLISHED` course (the guard blocks it with a `400`). If the platform ever needs instructors to update published courses, a separate workflow (e.g. `POST /courses/:id/update-request`) would be needed — submitting again would reset a published course to pending, which would break student access. That is a future design problem, not a current one.
+
+---
+
+### 3.6 The Full Flow
+
+**Successful submission:**
+
+```
+Browser (instructor)       NestJS                         PostgreSQL         Mailtrap (SMTP)
+        |                     |                               |                    |
+        |-- POST              |                               |                    |
+        |   /courses/id/submit|                               |                    |
+        |   (no body)         |                               |                    |
+        |              ValidationPipe (no body)               |                    |
+        |              JwtAuthGuard ✓                         |                    |
+        |                     |                               |                    |
+        |              CoursesService.submitForReview()       |                    |
+        |                     |                               |                    |
+        |                     |--- SELECT EXISTS courses ---->|                    |
+        |                     |    WHERE course_id = id       |                    |
+        |                     |<-- true ---------------------|                    |
+        |                     |                               |                    |
+        |                     |--- SELECT FROM courses ------>|                    |
+        |                     |    WHERE id = ? AND           |                    |
+        |                     |      instructor_id = userId   |                    |
+        |                     |<-- { status: 'draft' } -------|                    |
+        |                     |                               |                    |
+        |              status === DRAFT ✓ (valid source)      |                    |
+        |              course.status = 'pending'              |                    |
+        |                     |                               |                    |
+        |                     |--- UPDATE courses ----------->|                    |
+        |                     |    SET status='pending'       |                    |
+        |                     |    WHERE course_id = id       |                    |
+        |                     |<-- { status: 'pending' } -----|                    |
+        |                     |                               |                    |
+        |<-- 200 + course ----|                               |                    |
+        |    { status:        |                               |                    |
+        |      'pending' }    |  (fire-and-forget starts)     |                    |
+        |                     |--- SELECT FROM courses ------>|                    |
+        |                     |    JOIN instructor            |                    |
+        |                     |<-- { full_name:'Jane Doe' }--|                    |
+        |                     |                               |                    |
+        |                     |------- SMTP sendMail -------------------------------->|
+        |                     |        subject: "Course submitted for review: ..."    |
+        |                     |        to: admin@betazoid.com                         |
+        |                     |<------ 250 OK ----------------------------------------|
+```
+
+**Already-pending course (blocked):**
+
+```
+Browser (instructor)       NestJS                         PostgreSQL
+        |                     |                               |
+        |-- POST              |                               |
+        |   /courses/id/submit|                               |
+        |              JwtAuthGuard ✓                         |
+        |                     |--- SELECT EXISTS + SELECT --> |
+        |                     |<-- { status: 'pending' } ----|
+        |              status !== DRAFT and !== REJECTED      |
+        |              → throw BadRequestException            |
+        |<-- 400 "Only draft or rejected courses can be submitted for review"
 ```

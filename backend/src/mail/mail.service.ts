@@ -41,4 +41,23 @@ export class MailService {
         });
     }
 
+    async sendCourseSubmittedNotification(
+        adminEmail: string,
+        instructorName: string,
+        courseTitle: string,
+        courseId: string,
+    ): Promise<void> {
+        await this.transporter.sendMail({
+            from: this.config.get('MAIL_FROM'),
+            to: adminEmail,
+            subject: `Course submitted for review: ${courseTitle}`,
+            html: `
+    <h2>New course pending review</h2>
+    <p><strong>Course:</strong> ${courseTitle}</p>
+    <p><strong>Instructor:</strong> ${instructorName}</p>
+    <p><strong>Course ID:</strong> ${courseId}</p>
+    <p>Please log in to review and approve or reject this course.</p>`,
+        });
+    }
+
 }

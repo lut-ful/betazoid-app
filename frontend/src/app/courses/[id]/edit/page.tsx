@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Separator } from '@/components/ui/separator';
 
 const courseSchema = z.object({
     title: z.string().min(1, 'Title is required').max(200),
@@ -50,6 +51,7 @@ export default function EditCoursePage() {
     const courseId = params.id as string;
     const accessToken = useAuthStore((s) => s.accessToken);
     const queryClient = useQueryClient();
+    const [confirmSubmit, setConfirmSubmit] = useState(false);
 
     useEffect(() => {
         if (!accessToken) router.push('/login');
@@ -106,6 +108,15 @@ export default function EditCoursePage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['my-courses'] });
             queryClient.invalidateQueries({ queryKey: ['course', courseId] });
+        },
+    });
+
+    const submitMutation = useMutation({
+        mutationFn: () => api.post(`/courses/${courseId}/submit`),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['my-courses'] });
+            queryClient.invalidateQueries({ queryKey: ['course', courseId] });
+            setConfirmSubmit(false);
         },
     });
 
@@ -218,6 +229,42 @@ export default function EditCoursePage() {
                             </Button>
                         </div>
                     </form>
+
+                    <Separator className="my-6" />
+
+                    <div className="space-y-2">
+                        <p className="text-sm font-medium">Ready to publish?</p>
+                        <p className="text-sm text-muted-foreground">
+                            Submit your course for admin review. You will not be able to edit it while the review is pending.
+                        </p>
+                        {!confirmSubmit ? (
+                            <Button variant="outline" onClick={() => setConfirmSubmit(true)}>
+                                Submit for Review
+                            </Button>
+                        ) : (
+                            <div className="space-y-2">
+                                <p className="text-sm text-destructive">
+                                    Once submitted you cannot edit this course until the review is complete. Continue?
+                                </p>
+                                {submitMutation.isError && (
+                                    <p className="text-sm text-destructive">
+                                        {(submitMutation.error as any)?.response?.data?.message ?? 'Failed to submit course.'}
+                                    </p>
+                                )}
+                                <div className="flex gap-2">
+                                    <Button
+                                        disabled={submitMutation.isPending}
+                                        onClick={() => submitMutation.mutate()}
+                                    >
+                                        {submitMutation.isPending ? 'Submitting...' : 'Confirm Submit'}
+                                    </Button>
+                                    <Button variant="outline" onClick={() => setConfirmSubmit(false)}>
+                                        Cancel
+                                    </Button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
                 </CardContent>
             </Card>
         </div>
