@@ -5,6 +5,7 @@ import { CoursesModule } from './courses/courses.module';
 import { PermissionsModule } from './permissions/permissions.module';
 import { RedisModule } from './redis/redis.module';
 import { RolesModule } from './roles/roles.module';
+import { SectionsModule } from './sections/sections.module';
 import { UsersModule } from './users/users.module';
 import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
@@ -37,6 +38,7 @@ import { PermissionsGuard } from './auth/guards/permissions.guard';
     CoursesModule,
     PermissionsModule,
     RolesModule,
+    SectionsModule,
     UsersModule,
   ],
   providers: [

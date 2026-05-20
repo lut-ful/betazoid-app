@@ -237,6 +237,9 @@ export default function EditCoursePage() {
                             <Button variant="outline" asChild>
                                 <Link href="/courses">Back</Link>
                             </Button>
+                            <Button variant="outline" asChild>
+                                <Link href={`/courses/${courseId}/sections`}>Manage Sections</Link>
+                            </Button>
                         </div>
                     </form>
 
