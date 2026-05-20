@@ -7,15 +7,18 @@ import {
     Param,
     Patch,
     Post,
+    Query,
     Request,
     UseGuards,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { Public } from '../auth/decorators/public.decorator';
 import { RequirePermission } from '../auth/decorators/require-permission.decorator';
 import { CoursesService } from './courses.service';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { RejectCourseDto } from './dto/reject-course.dto';
+import { SearchCoursesDto } from './dto/search-courses.dto';
 
 @Controller('courses')
 @UseGuards(JwtAuthGuard)
@@ -31,6 +34,12 @@ export class CoursesController {
     @Get()
     findMyCourses(@Request() req: any) {
         return this.coursesService.findByInstructor(req.user.userId);
+    }
+
+    @Public()
+    @Get('search')
+    search(@Query() dto: SearchCoursesDto) {
+        return this.coursesService.search(dto);
     }
 
     @Get('pending')

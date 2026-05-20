@@ -11,8 +11,21 @@ import { Course, CourseStatus } from './entities/course.entity';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { RejectCourseDto } from './dto/reject-course.dto';
+import { SearchCoursesDto } from './dto/search-courses.dto';
 import { Category } from '../categories/entities/category.entity';
 import { MailService } from '../mail/mail.service';
+
+export interface CourseSearchResult {
+    course_id: string;
+    title: string;
+    instructor_name: string;
+    category_name: string | null;
+    level: string;
+    language: string;
+    price: number;
+    rating: number;
+    thumbnail_url: string | null;
+}
 
 @Injectable()
 export class CoursesService {
@@ -178,6 +191,68 @@ export class CoursesService {
             .catch(() => {});
 
         return saved;
+    }
+
+    async search(dto: SearchCoursesDto): Promise<CourseSearchResult[]> {
+        const qb = this.courseRepo
+            .createQueryBuilder('course')
+            .leftJoin('course.instructor', 'instructor')
+            .leftJoin('course.category', 'category')
+            .select([
+                'course.course_id',
+                'course.title',
+                'course.level',
+                'course.language',
+                'course.price',
+                'course.rating',
+                'course.thumbnail_url',
+                'instructor.full_name',
+                'category.name',
+            ])
+            .where('course.status = :status', { status: CourseStatus.PUBLISHED });
+
+        if (dto.q?.trim()) {
+            qb.andWhere(
+                `to_tsvector('english', course.title || ' ' || course.description) @@ plainto_tsquery('english', :q)`,
+                { q: dto.q.trim() },
+            );
+        }
+
+        if (dto.category) {
+            qb.andWhere('category.category_id = :category', { category: dto.category });
+        }
+
+        if (dto.level) {
+            qb.andWhere('course.level = :level', { level: dto.level });
+        }
+
+        if (dto.language) {
+            qb.andWhere('course.language ILIKE :language', { language: dto.language });
+        }
+
+        if (dto.minPrice !== undefined) {
+            qb.andWhere('CAST(course.price AS DECIMAL) >= :minPrice', { minPrice: dto.minPrice });
+        }
+
+        if (dto.maxPrice !== undefined) {
+            qb.andWhere('CAST(course.price AS DECIMAL) <= :maxPrice', { maxPrice: dto.maxPrice });
+        }
+
+        qb.orderBy('course.created_at', 'DESC').limit(40);
+
+        const rows = await qb.getMany();
+
+        return rows.map((c) => ({
+            course_id: c.course_id,
+            title: c.title,
+            instructor_name: c.instructor?.full_name ?? '',
+            category_name: c.category?.name ?? null,
+            level: c.level,
+            language: c.language,
+            price: parseFloat(c.price as unknown as string),
+            rating: parseFloat(c.rating as unknown as string),
+            thumbnail_url: c.thumbnail_url,
+        }));
     }
 
     async rejectCourse(courseId: string, dto: RejectCourseDto): Promise<Course> {

@@ -1944,3 +1944,336 @@ Browser (instructor — later)
         |-- (edits the course)
         |-- POST /courses/id/submit   (re-submits → status back to PENDING)
 ```
+
+---
+
+## 5. US-15 — Search and Filter Courses
+
+> *As a Student, I want to search and filter courses so that I can find courses relevant to my interests.*
+
+### Acceptance Criteria
+- Student can search by keyword
+- Filters available: category, level, language, price range
+- Results show course thumbnail, title, instructor name, rating, and price
+
+---
+
+### 5.1 Theory — PostgreSQL Full-Text Search
+
+When you search for "javascript async" in a course catalogue, you don't want to do:
+
+```sql
+WHERE title LIKE '%javascript async%'
+```
+
+That query is case-sensitive, order-dependent, and can't understand that "async" is related to "asynchronous". It also needs a full table scan.
+
+**Full-Text Search (FTS)** solves all three problems. PostgreSQL has it built in — no separate search service needed.
+
+#### Two key data types
+
+| Type | What it holds | How it's built |
+|---|---|---|
+| `tsvector` | A sorted list of *lexemes* (normalised word stems) with position data | `to_tsvector('english', text)` |
+| `tsquery` | A query expression of lexemes with AND/OR/NOT operators | `to_tsquery(...)`, `plainto_tsquery(...)` |
+
+The `@@` operator tests whether a `tsquery` matches a `tsvector`:
+
+```sql
+to_tsvector('english', 'JavaScript Async Patterns') @@ plainto_tsquery('english', 'javascript async')
+-- returns TRUE
+```
+
+#### How lexemes work
+
+`to_tsvector('english', 'Running asynchronous JavaScript functions')` produces:
+
+```
+'async':2 'function':4 'javascript':3 'run':1
+```
+
+Notice what happened:
+- **Running** → `run` (stemmed)
+- **asynchronous** → `async` (stemmed)
+- Stop words like "and", "the" are dropped automatically
+- Position numbers are stored so phrase queries work
+
+`plainto_tsquery('english', 'async javascript')` is the safe user-input version. It treats the input as a sequence of words joined by AND — no special operator syntax the user could accidentally break.
+
+#### Why not LIKE?
+
+| | LIKE `%keyword%` | Full-Text Search |
+|---|---|---|
+| Case-insensitive | Only with `ILIKE` | Yes (built-in) |
+| Stemming (`run` matches `running`) | No | Yes |
+| GIN index support | No | Yes |
+| Multi-word relevance | No | Yes |
+| SQL injection risk via pattern | Lower with params | Lower with params |
+
+#### The `rating` column
+
+The `courses` table has a `rating` column (decimal, default 0). This is a **denormalised aggregate** — a copy of the computed average, stored on the row so searches can return it without a subquery. The reviews module (Sprint 9) will update it every time a student submits a review. For now it defaults to 0.0 for all courses.
+
+---
+
+### 5.2 Backend — Public search endpoint
+
+```
+GET /api/v1/courses/search
+No Authorization header required (public endpoint)
+
+Query parameters (all optional):
+  q         — keyword string (passed to plainto_tsquery)
+  category  — UUID of a category
+  level     — beginner | intermediate | advanced
+  language  — string (ILIKE match)
+  minPrice  — number
+  maxPrice  — number
+
+Response: 200 OK
+[
+  {
+    "course_id": "uuid",
+    "title": "...",
+    "instructor_name": "...",
+    "category_name": "...",
+    "level": "beginner",
+    "language": "English",
+    "price": 29.99,
+    "rating": 0.0,
+    "thumbnail_url": null
+  }
+]
+```
+
+#### Entity change — `rating` column
+
+```typescript
+// backend/src/courses/entities/course.entity.ts
+@Column({ type: 'decimal', precision: 3, scale: 2, default: 0 })
+rating!: number;
+```
+
+`precision: 3, scale: 2` means values like `4.75` (max `9.99`). The column has default 0 so existing rows get 0.00 without a migration step.
+
+#### DTO — `search-courses.dto.ts`
+
+```typescript
+export class SearchCoursesDto {
+    @IsOptional() @IsString()
+    q?: string;
+
+    @IsOptional() @IsUUID()
+    category?: string;
+
+    @IsOptional() @IsIn(Object.values(CourseLevel))
+    level?: string;
+
+    @IsOptional() @IsString()
+    language?: string;
+
+    @IsOptional() @Type(() => Number) @IsNumber()
+    minPrice?: number;
+
+    @IsOptional() @Type(() => Number) @IsNumber()
+    maxPrice?: number;
+}
+```
+
+Key points:
+- Every field is `@IsOptional()` — a search with no filters is valid (returns all published courses)
+- `minPrice` and `maxPrice` arrive as **strings** from the URL query string (`?minPrice=10`). The `@Type(() => Number)` decorator from `class-transformer` coerces them to numbers before `@IsNumber()` validates them
+- `@IsIn(Object.values(CourseLevel))` rejects unknown levels like `"expert"` at the DTO layer
+
+#### Service — `search()` method
+
+```typescript
+async search(dto: SearchCoursesDto): Promise<CourseSearchResult[]> {
+    // 1. Start building the query — left join instructor and category
+    //    so we can select their names even if category is null
+    const qb = this.courseRepo
+        .createQueryBuilder('course')
+        .leftJoin('course.instructor', 'instructor')
+        .leftJoin('course.category', 'category')
+        .select([
+            'course.course_id', 'course.title', 'course.level',
+            'course.language', 'course.price', 'course.rating',
+            'course.thumbnail_url',
+            'instructor.full_name',
+            'category.name',
+        ])
+        // 2. Always filter to published courses only
+        .where('course.status = :status', { status: CourseStatus.PUBLISHED });
+
+    // 3. Only add the FTS clause if q is non-empty after trimming
+    if (dto.q?.trim()) {
+        qb.andWhere(
+            `to_tsvector('english', course.title || ' ' || course.description)
+             @@ plainto_tsquery('english', :q)`,
+            { q: dto.q.trim() },
+        );
+    }
+
+    // 4. Each filter is an independent andWhere — only added when the
+    //    client sends the parameter
+    if (dto.category) qb.andWhere('category.category_id = :category', { category: dto.category });
+    if (dto.level)    qb.andWhere('course.level = :level', { level: dto.level });
+    if (dto.language) qb.andWhere('course.language ILIKE :language', { language: dto.language });
+
+    // 5. TypeORM stores decimal as string in PG — cast before comparing
+    if (dto.minPrice !== undefined)
+        qb.andWhere('CAST(course.price AS DECIMAL) >= :minPrice', { minPrice: dto.minPrice });
+    if (dto.maxPrice !== undefined)
+        qb.andWhere('CAST(course.price AS DECIMAL) <= :maxPrice', { maxPrice: dto.maxPrice });
+
+    qb.orderBy('course.created_at', 'DESC').limit(40);
+
+    const rows = await qb.getMany();
+
+    // 6. Map to a flat response — parseFloat because TypeORM returns
+    //    decimal columns as strings from PostgreSQL
+    return rows.map((c) => ({
+        course_id: c.course_id,
+        title: c.title,
+        instructor_name: c.instructor?.full_name ?? '',
+        category_name: c.category?.name ?? null,
+        level: c.level,
+        language: c.language,
+        price: parseFloat(c.price as unknown as string),
+        rating: parseFloat(c.rating as unknown as string),
+        thumbnail_url: c.thumbnail_url,
+    }));
+}
+```
+
+**Why `CAST(course.price AS DECIMAL)`?** TypeORM's `decimal` column type maps to PostgreSQL `NUMERIC`. When you bind `:minPrice` as a JavaScript number, PostgreSQL will happily compare the two — but adding the explicit cast makes the intent unambiguous and avoids any implicit coercion edge cases.
+
+**Why `ILIKE` for language?** Language is stored as free text (e.g. `"English"`, `"english"`, `"ENGLISH"` are all valid instructor entries). `ILIKE` is case-insensitive pattern match, so the filter is forgiving.
+
+#### Controller — public `GET /courses/search`
+
+```typescript
+@Controller('courses')
+@UseGuards(JwtAuthGuard)       // ← class-level guard applies to all routes
+export class CoursesController {
+
+    @Public()                   // ← bypasses JwtAuthGuard for this handler only
+    @Get('search')
+    search(@Query() dto: SearchCoursesDto) {
+        return this.coursesService.search(dto);
+    }
+
+    // ... other protected routes
+}
+```
+
+Three important decisions here:
+
+1. **`@Public()` at method level** — The `JwtAuthGuard` checks for the `isPublic` metadata on both the handler and the class. Setting it on the handler lets this one route bypass auth while all other routes on `CoursesController` remain protected.
+
+2. **Route ordering** — `GET search` must be declared **before** `GET :id`. NestJS routes are matched top to bottom; if `:id` came first, the string `"search"` would be captured as the ID parameter and the UUID pipe (or service) would reject it.
+
+3. **`@Query()` with a DTO class** — When `@Query()` receives a class type, NestJS runs the global `ValidationPipe` with `transform: true` on the query parameters, which triggers `class-transformer` (so `@Type(() => Number)` coerces `minPrice`/`maxPrice`).
+
+---
+
+### 5.3 Frontend — Browse Courses page
+
+**Route:** `/search` — public, no auth guard, accessible from the Navbar "Browse" link.
+
+#### State management pattern — two `useState` objects
+
+```typescript
+const [params, setParams] = useState<SearchParams>({ q:'', category:'', ... });
+const [submitted, setSubmitted] = useState<SearchParams>(params);
+```
+
+`params` tracks what's currently typed in the form. `submitted` holds the last **submitted** snapshot. The `useQuery` key is `['course-search', submitted]` — so the API call only fires when the user presses **Search**, not on every keystroke. This prevents a new request every character typed.
+
+```typescript
+function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setSubmitted(params);     // copy current params → submitted
+}                             // TanStack Query sees a new key → refetches
+```
+
+#### Two separate queries
+
+```typescript
+// 1. Categories — fetched once on mount for the dropdown
+const { data: categories } = useQuery({
+    queryKey: ['categories'],
+    queryFn: () => api.get('/categories').then(r => r.data),
+});
+
+// 2. Search results — refetches only when `submitted` changes
+const { data: results, isLoading, isError } = useQuery({
+    queryKey: ['course-search', submitted],
+    queryFn: () => {
+        const qs = new URLSearchParams();
+        if (submitted.q) qs.set('q', submitted.q);
+        // ... add other params if non-empty
+        return api.get(`/courses/search?${qs.toString()}`).then(r => r.data);
+    },
+});
+```
+
+Note that neither query has `enabled: !!accessToken` — they are intentionally unauthenticated.
+
+#### Result card
+
+Each result renders: thumbnail (if present), title, instructor name, category, level/language, star rating, and price. `Number(course.rating).toFixed(1)` and `Number(course.price).toFixed(2)` guard against the `string` form TypeORM sometimes returns even through the serialised JSON.
+
+---
+
+### 5.4 Security / Design Notes
+
+**No auth on the search endpoint** — this is correct. Course discovery is public. If someone scrapes the catalogue, they see only published metadata — no proprietary content (videos are behind YouTube private playlists controlled by enrollment).
+
+**SQL injection** — both the FTS clause and all filter clauses use parameterised bindings (`:q`, `:category`, etc.). The `plainto_tsquery` function itself sanitises its input, and TypeORM always uses prepared statements for named parameters. There is no string concatenation into SQL.
+
+**Decimal as string** — TypeORM reads PostgreSQL `NUMERIC`/`DECIMAL` columns back as JavaScript strings to preserve precision. The `parseFloat()` in the service mapping converts them to numbers before the response is serialised to JSON. On the frontend, `Number(course.price)` is a safety wrapper in case the JSON still arrives as a string.
+
+**`rating` defaults to 0** — Sprint 9 (US-34) will implement the reviews module which updates this column. Until then, all courses show ★ 0.0. This is acceptable because the search page is public-facing but the platform has no live students yet at this stage.
+
+**Route conflict prevention** — `GET /courses/search` sits above `GET /courses/:id` in the controller. This is a NestJS routing invariant: static path segments (literal strings) must be declared before dynamic segments (`:param`) in the same controller class.
+
+---
+
+### 5.5 The full flow
+
+```
+Browser                   NestJS CoursesController       PostgreSQL
+   |                               |                          |
+   |-- GET /courses/search ------->|                          |
+   |   ?q=javascript               |                          |
+   |   &level=beginner             |                          |
+   |   &maxPrice=50                |                          |
+   |                               |-- ValidationPipe ------->|
+   |                               |   (transforms query      |
+   |                               |    params via DTO)       |
+   |                               |                          |
+   |                               |  CoursesService.search() |
+   |                               |-- SELECT courses,        |
+   |                               |   instructor.full_name,  |
+   |                               |   category.name          |
+   |                               |   WHERE status='published'
+   |                               |   AND to_tsvector(...) @@|
+   |                               |       plainto_tsquery(   |
+   |                               |         'javascript')    |
+   |                               |   AND level='beginner'   |
+   |                               |   AND price <= 50        |
+   |                               |   ORDER BY created_at    |
+   |                               |   LIMIT 40 ------------>|
+   |                               |<-- rows [] --------------|
+   |                               |                          |
+   |                               |  map rows → JSON array   |
+   |                               |  (parseFloat price,rating)
+   |<-- 200 + JSON array ----------|                          |
+
+Parallel (categories dropdown):
+   |-- GET /categories ----------->|                          |
+   |   (public, no auth)           |-- SELECT * categories -->|
+   |                               |<-- rows [] --------------|
+   |<-- 200 + categories array ----|                          |
+```

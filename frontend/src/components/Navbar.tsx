@@ -31,6 +31,10 @@ export default function Navbar() {
                 </Link>
 
                 <nav className="flex items-center gap-2">
+                    <Button variant="ghost" size="sm" asChild>
+                        <Link href="/search">Browse</Link>
+                    </Button>
+                    <Separator orientation="vertical" className="h-5" />
                     {accessToken ? (
                         <>
                             <Button variant="ghost" asChild>

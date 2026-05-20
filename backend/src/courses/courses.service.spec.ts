@@ -7,6 +7,17 @@ import { Course, CourseStatus, CourseLevel } from './entities/course.entity';
 import { Category } from '../categories/entities/category.entity';
 import { MailService } from '../mail/mail.service';
 import { RejectCourseDto } from './dto/reject-course.dto';
+import { SearchCoursesDto } from './dto/search-courses.dto';
+
+const mockQueryBuilder = () => ({
+    leftJoin: jest.fn().mockReturnThis(),
+    select: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    orderBy: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    getMany: jest.fn().mockResolvedValue([]),
+});
 
 const mockCourseRepo = () => ({
     create: jest.fn(),
@@ -14,6 +25,7 @@ const mockCourseRepo = () => ({
     find: jest.fn(),
     findOne: jest.fn(),
     exists: jest.fn(),
+    createQueryBuilder: jest.fn(() => mockQueryBuilder()),
 });
 
 const mockCategoryRepo = () => ({
@@ -39,6 +51,7 @@ const baseCourse = (): Course => ({
     language: 'English',
     level: CourseLevel.BEGINNER,
     status: CourseStatus.DRAFT,
+    rating: 0,
     rejection_reason: null,
     instructor: { user_id: 'instructor-uuid-1', full_name: 'Jane Doe', email: 'jane@example.com' } as any,
     category: null,
@@ -333,5 +346,131 @@ describe('CoursesService — rejectCourse', () => {
         await expect(service.rejectCourse('nonexistent-id', rejectDto)).rejects.toBeInstanceOf(
             NotFoundException,
         );
+    });
+});
+
+describe('CoursesService — search', () => {
+    let service: CoursesService;
+    let courseRepo: ReturnType<typeof mockCourseRepo>;
+
+    const publishedCourse = (): Course => ({
+        ...baseCourse(),
+        status: CourseStatus.PUBLISHED,
+        instructor: { user_id: 'instructor-uuid-1', full_name: 'Jane Doe', email: 'jane@example.com' } as any,
+        category: { category_id: 'cat-1', name: 'Programming' } as any,
+    });
+
+    beforeEach(async () => {
+        const module: TestingModule = await Test.createTestingModule({
+            providers: [
+                CoursesService,
+                { provide: getRepositoryToken(Course), useFactory: mockCourseRepo },
+                { provide: getRepositoryToken(Category), useFactory: mockCategoryRepo },
+                { provide: MailService, useFactory: mockMailService },
+                { provide: ConfigService, useFactory: mockConfigService },
+            ],
+        }).compile();
+
+        service = module.get(CoursesService);
+        courseRepo = module.get(getRepositoryToken(Course));
+    });
+
+    it('returns mapped search results for published courses', async () => {
+        const course = publishedCourse();
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([course]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        const dto: SearchCoursesDto = {};
+        const results = await service.search(dto);
+
+        expect(results).toHaveLength(1);
+        expect(results[0]).toMatchObject({
+            course_id: course.course_id,
+            title: course.title,
+            instructor_name: 'Jane Doe',
+            category_name: 'Programming',
+            level: CourseLevel.BEGINNER,
+            language: 'English',
+        });
+    });
+
+    it('applies keyword filter when q is provided', async () => {
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        await service.search({ q: 'javascript' });
+
+        expect(qb.andWhere).toHaveBeenCalledWith(
+            expect.stringContaining('plainto_tsquery'),
+            expect.objectContaining({ q: 'javascript' }),
+        );
+    });
+
+    it('applies category filter when category is provided', async () => {
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        await service.search({ category: 'cat-uuid-1' });
+
+        expect(qb.andWhere).toHaveBeenCalledWith(
+            expect.stringContaining('category.category_id'),
+            expect.objectContaining({ category: 'cat-uuid-1' }),
+        );
+    });
+
+    it('applies level filter when level is provided', async () => {
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        await service.search({ level: CourseLevel.BEGINNER });
+
+        expect(qb.andWhere).toHaveBeenCalledWith(
+            expect.stringContaining('course.level'),
+            expect.objectContaining({ level: CourseLevel.BEGINNER }),
+        );
+    });
+
+    it('applies price range filters when minPrice and maxPrice are provided', async () => {
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        await service.search({ minPrice: 10, maxPrice: 50 });
+
+        expect(qb.andWhere).toHaveBeenCalledWith(
+            expect.stringContaining('minPrice'),
+            expect.objectContaining({ minPrice: 10 }),
+        );
+        expect(qb.andWhere).toHaveBeenCalledWith(
+            expect.stringContaining('maxPrice'),
+            expect.objectContaining({ maxPrice: 50 }),
+        );
+    });
+
+    it('skips keyword filter when q is empty', async () => {
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        await service.search({ q: '  ' });
+
+        const ftsCallArgs = (qb.andWhere as jest.Mock).mock.calls.find(
+            ([sql]: [string]) => typeof sql === 'string' && sql.includes('plainto_tsquery'),
+        );
+        expect(ftsCallArgs).toBeUndefined();
+    });
+
+    it('returns empty array when no published courses match', async () => {
+        const qb = mockQueryBuilder();
+        qb.getMany.mockResolvedValue([]);
+        courseRepo.createQueryBuilder.mockReturnValue(qb);
+
+        const results = await service.search({ q: 'nonexistent topic' });
+
+        expect(results).toEqual([]);
     });
 });

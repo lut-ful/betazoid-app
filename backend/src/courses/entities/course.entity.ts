@@ -55,6 +55,9 @@ export class Course {
     })
     status!: CourseStatus;
 
+    @Column({ type: 'decimal', precision: 3, scale: 2, default: 0 })
+    rating!: number;
+
     @Column({ type: 'text', nullable: true })
     rejection_reason!: string | null;
 
