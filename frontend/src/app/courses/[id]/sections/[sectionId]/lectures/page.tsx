@@ -275,6 +275,13 @@ export default function LecturesPage() {
                                             >
                                                 Rename
                                             </Button>
+                                            <Button size="sm" variant="outline" asChild>
+                                                <Link
+                                                    href={`/courses/${courseId}/sections/${sectionId}/lectures/${lecture.lecture_id}/resources`}
+                                                >
+                                                    Resources
+                                                </Link>
+                                            </Button>
                                             <Button
                                                 size="sm"
                                                 variant="destructive"

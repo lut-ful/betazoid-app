@@ -12,6 +12,7 @@
 1. [US-16 — Section Management](#1-us-16--section-management)
 2. [US-17 — Create Lecture](#2-us-17--create-lecture)
 3. [US-18 — Free Preview Toggle](#3-us-18--free-preview-toggle)
+4. [US-19 — Attach Lecture Resources](#4-us-19--attach-lecture-resources)
 
 ---
 
@@ -1243,4 +1244,615 @@ Browser (no JWT)         NestJS (CoursesController)           PostgreSQL
   |            is_free_preview: true/false }                        |
   |        ]}                       |                               |
   |      ]}                         |                               |
+```
+
+---
+
+## 4. US-19 — Attach Lecture Resources
+
+> *As an Instructor, I want to attach downloadable resources to a lecture so that students have supplementary materials.*
+
+### Acceptance Criteria
+- Instructor can upload files (PDF, ZIP, slide) or add external links
+- Multiple resources can be attached to a single lecture
+- Resources are listed and downloadable on the lecture page
+
+---
+
+### 4.1 Theory — Supplementary Resources and the Two Resource Types
+
+A lecture's primary content is its video, article text, or quiz. Resources are *secondary* attachments — extra material that enriches the learning experience but is not the lecture itself. Typical examples:
+
+- A PDF of the slides used in a video lecture
+- A ZIP archive of starter code
+- A link to an official documentation page
+- A spreadsheet template for an exercise
+
+Two models exist for delivering these resources:
+
+| Type | Storage | Access |
+|---|---|---|
+| **Uploaded file** | Server disk (or S3/R2 in production) | Student downloads from the platform URL |
+| **External link** | Only the URL stored | Student is redirected to the external site |
+
+Both types are stored in the same `lecture_resources` table. A `resource_type` enum column (`'file'` or `'link'`) acts as the discriminator — it tells the application how to interpret the `url` column:
+
+```
+lecture_resources
+┌─────────────┬──────────────────┬───────────┬──────────────────────────────────────┬───────────────────┐
+│ resource_id │      title       │ res_type  │                  url                 │ original_filename │
+├─────────────┼──────────────────┼───────────┼──────────────────────────────────────┼───────────────────┤
+│ uuid-A      │ Slide deck       │ link      │ https://slides.example.com/deck.pdf  │ NULL              │
+│ uuid-B      │ Exercise files   │ file      │ /uploads/resources/16782934-abc.zip  │ exercises.zip     │
+│ uuid-C      │ Cheat sheet      │ file      │ /uploads/resources/16782935-def.pdf  │ cheatsheet.pdf    │
+└─────────────┴──────────────────┴───────────┴──────────────────────────────────────┴───────────────────┘
+```
+
+`original_filename` stores the user's original filename (e.g., `exercises.zip`) separately from the stored filename (e.g., `16782934-abc.zip`). The stored name is unique and collision-safe; the original name is shown in the UI so students see a human-readable label.
+
+---
+
+### 4.2 Theory — File Uploads with Multer in NestJS
+
+HTTP forms normally send data as URL-encoded strings. File uploads use a different content type: `multipart/form-data`. The browser packages the file's binary content alongside any accompanying text fields into a single HTTP body with boundary markers separating the parts.
+
+```
+POST /resources/file
+Content-Type: multipart/form-data; boundary=----boundary123
+
+----boundary123
+Content-Disposition: form-data; name="title"
+
+Exercise files
+----boundary123
+Content-Disposition: form-data; name="file"; filename="exercises.zip"
+Content-Type: application/zip
+
+<binary file content>
+----boundary123--
+```
+
+NestJS (via `@nestjs/platform-express`) bundles **Multer** — a Node.js middleware that parses `multipart/form-data` bodies. In a NestJS controller, you activate it per-endpoint with `@UseInterceptors(FileInterceptor(...))`:
+
+```typescript
+@UseInterceptors(
+    FileInterceptor('file', {         // 'file' = the form field name
+        storage: diskStorage({ … }),  // where to save the file
+        fileFilter: …,                // which file types to accept
+        limits: { fileSize: … },      // size cap
+    }),
+)
+```
+
+After Multer processes the request:
+- The uploaded file's metadata is available via `@UploadedFile()` as an `Express.Multer.File` object
+- Text body fields (like `title`) are available via `@Body('field')` as usual
+
+**Disk storage vs. memory storage**
+
+Multer offers two built-in storage engines:
+- `memoryStorage()` — holds the file in RAM as a `Buffer`. Simple but exhausts server memory on large uploads.
+- `diskStorage()` — streams the file directly to disk. The upload does not accumulate in RAM. Better for files above a few MB.
+
+Betazoid uses `diskStorage` with files saved to `uploads/resources/` under the project's working directory. In production this would be replaced by an S3/R2 stream, but `diskStorage` is sufficient for a development environment.
+
+**Generating collision-safe filenames**
+
+Two students uploading a file named `notes.pdf` would collide if stored with their original names. Multer's `diskStorage.filename` callback generates a unique name:
+
+```typescript
+filename: (_req, file, cb) => {
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    cb(null, `${unique}${extname(file.originalname)}`);
+},
+```
+
+`Date.now()` provides millisecond-precision uniqueness; the random suffix handles the unlikely case of two concurrent uploads in the same millisecond. The original extension is preserved so the OS knows how to open the file.
+
+---
+
+### 4.3 Theory — Serving Static Files from NestJS
+
+An uploaded file saved to disk is just a file — the HTTP server does not automatically expose it. To let students download resources, the `uploads/` directory must be served as static assets.
+
+`NestExpressApplication` (the NestJS adapter that wraps Express) has a `useStaticAssets()` method that registers Express's `static()` middleware:
+
+```typescript
+app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads' });
+```
+
+This means any file at `<cwd>/uploads/resources/foo.zip` is accessible at `GET /uploads/resources/foo.zip` — no controller, no guard, no route required. The middleware serves it directly from disk.
+
+The `prefix: '/uploads'` option avoids a collision with the `/api/v1/` global prefix set for the NestJS application — static files are served outside the API namespace.
+
+**Security note:** All files under `uploads/` become publicly readable. In production you would:
+1. Move uploads to private S3/R2 (no public access)
+2. Generate pre-signed URLs (time-limited, authenticated) on demand
+3. Never expose the raw storage path in the URL
+
+For development, the public static approach is functional and sufficient.
+
+---
+
+### 4.4 Backend — Lecture Resources Module
+
+#### New entity — `lecture-resource.entity.ts`
+
+```typescript
+export const ResourceType = {
+    FILE: 'file',
+    LINK: 'link',
+} as const;
+export type ResourceType = (typeof ResourceType)[keyof typeof ResourceType];
+
+@Entity('lecture_resources')
+export class LectureResource {
+    @PrimaryGeneratedColumn('uuid')
+    resource_id!: string;
+
+    @Column({ length: 200 })
+    title!: string;
+
+    @Column({ type: 'enum', enum: Object.values(ResourceType) })
+    resource_type!: ResourceType;        // 'file' | 'link'
+
+    @Column({ type: 'varchar' })
+    url!: string;                        // relative path for files, full URL for links
+
+    @Column({ type: 'varchar', nullable: true })
+    original_filename!: string | null;   // null for links, original name for files
+
+    @ManyToOne(() => Lecture, { onDelete: 'CASCADE' })
+    @JoinColumn({ name: 'lecture_id' })
+    lecture!: Lecture;
+
+    @CreateDateColumn() created_at!: Date;
+    @UpdateDateColumn() updated_at!: Date;
+}
+```
+
+`onDelete: 'CASCADE'` — when a lecture is deleted, all its resources are automatically deleted by PostgreSQL. No application code is needed to clean up attached resources when a lecture is removed.
+
+The nullable pattern for `original_filename` follows the TypeORM convention from `.claude/rules/typeorm.md`: `nullable: true` in the decorator + `string | null` in the TypeScript type.
+
+#### DTO — `add-link.dto.ts`
+
+```typescript
+export class AddLinkDto {
+    @IsString()
+    @IsNotEmpty()
+    @MaxLength(200)
+    title!: string;
+
+    @IsUrl({}, { message: 'url must be a valid URL including http:// or https://' })
+    url!: string;
+}
+```
+
+`@IsUrl()` from `class-validator` validates that the URL includes a protocol (`http://` or `https://`). A bare domain like `example.com` would be rejected. This prevents instructors from accidentally submitting a relative path as an external link.
+
+File uploads have no DTO class — the file goes through Multer, and `title` is validated manually in the controller (since `ValidationPipe` does not apply to `@Body('field')` single-field extraction the same way it does to a full DTO class).
+
+#### Service — `lecture-resources.service.ts`
+
+The service introduces a private `verifyLectureOwnership` helper that extends the ownership chain by one more level compared to `LecturesService.verifySectionOwnership`:
+
+```typescript
+private async verifyLectureOwnership(
+    courseId: string,
+    sectionId: string,
+    lectureId: string,
+    instructorId: string,
+): Promise<Lecture> {
+    // Step 1: verify the section exists and the instructor owns the course
+    const section = await this.sectionRepo.findOne({
+        where: { section_id: sectionId, course: { course_id: courseId } },
+        relations: ['course', 'course.instructor'],
+    });
+    if (!section) throw new NotFoundException('Section not found');
+    if (section.course.instructor.user_id !== instructorId) {
+        throw new ForbiddenException('Access denied');
+    }
+    if (section.course.status === CourseStatus.PENDING) {
+        throw new ForbiddenException('Course cannot be edited while it is pending review');
+    }
+
+    // Step 2: verify the lecture exists and belongs to this section
+    const lecture = await this.lectureRepo.findOne({
+        where: { lecture_id: lectureId, section: { section_id: sectionId } },
+    });
+    if (!lecture) throw new NotFoundException('Lecture not found');
+    return lecture;
+}
+```
+
+This is effectively the same logic as `LecturesService.verifySectionOwnership` plus one extra step: checking that the lecture belongs to the given section. The private method is duplicated (not imported from `LecturesService`) because that method is `private` and because `LectureResourcesService` needs the `Lecture` object as its return value — it cannot use `void`.
+
+**`addLink`:**
+
+```typescript
+async addLink(courseId, sectionId, lectureId, dto: AddLinkDto, instructorId): Promise<LectureResource> {
+    const lecture = await this.verifyLectureOwnership(courseId, sectionId, lectureId, instructorId);
+
+    const resource = this.resourceRepo.create({
+        title: dto.title,
+        resource_type: ResourceType.LINK,
+        url: dto.url,
+        original_filename: null,   // links have no filename
+        lecture,
+    });
+    return this.resourceRepo.save(resource);
+}
+```
+
+**`addFile`:**
+
+```typescript
+async addFile(courseId, sectionId, lectureId, file: Express.Multer.File, title: string, instructorId): Promise<LectureResource> {
+    const lecture = await this.verifyLectureOwnership(courseId, sectionId, lectureId, instructorId);
+
+    const resource = this.resourceRepo.create({
+        title,
+        resource_type: ResourceType.FILE,
+        url: `/uploads/resources/${file.filename}`,  // relative path served as static asset
+        original_filename: file.originalname,         // shown in UI for human readability
+        lecture,
+    });
+    return this.resourceRepo.save(resource);
+}
+```
+
+`file.filename` is the Multer-generated unique name (e.g., `1698234567890-123456789.zip`). `file.originalname` is the name the user chose (`exercises.zip`).
+
+**`remove`:**
+
+```typescript
+async remove(courseId, sectionId, lectureId, resourceId, instructorId): Promise<void> {
+    await this.verifyLectureOwnership(courseId, sectionId, lectureId, instructorId);
+
+    const resource = await this.resourceRepo.findOne({
+        where: { resource_id: resourceId, lecture: { lecture_id: lectureId } },
+    });
+    if (!resource) throw new NotFoundException('Resource not found');
+
+    // For file resources, attempt to clean up the file from disk
+    if (resource.resource_type === ResourceType.FILE) {
+        try {
+            unlinkSync(join(process.cwd(), resource.url));
+        } catch {
+            // File may already be gone — silently ignore
+        }
+    }
+
+    await this.resourceRepo.remove(resource);
+}
+```
+
+`unlinkSync` deletes the physical file from disk when the DB record is removed. Errors are silenced because the DB record is the source of truth — if the file was already manually deleted or never written, the remove operation should still succeed.
+
+#### Controller — `lecture-resources.controller.ts`
+
+The controller uses a deeply nested route prefix that mirrors the data hierarchy exactly:
+
+```typescript
+@Controller('courses/:courseId/sections/:sectionId/lectures/:lectureId/resources')
+@UseGuards(JwtAuthGuard)
+export class LectureResourcesController {
+```
+
+Full endpoint table:
+
+```
+POST   …/resources/link          → addLink   (JSON body: { title, url })
+POST   …/resources/file          → addFile   (multipart/form-data: title + file)
+GET    …/resources               → findAll   (list for this lecture)
+DELETE …/resources/:resourceId   → remove    (204 No Content)
+```
+
+The file upload endpoint:
+
+```typescript
+@Post('file')
+@HttpCode(HttpStatus.CREATED)
+@UseInterceptors(
+    FileInterceptor('file', {
+        storage: resourceStorage,   // diskStorage defined at module level
+        fileFilter: (_req, file, cb) => {
+            if (allowedExtensions.includes(extname(file.originalname).toLowerCase())) {
+                cb(null, true);
+            } else {
+                cb(new BadRequestException(`File type not allowed. Allowed: ${allowedExtensions.join(', ')}`), false);
+            }
+        },
+        limits: { fileSize: 50 * 1024 * 1024 },  // 50 MB hard cap
+    }),
+)
+addFile(
+    @Param('courseId') courseId: string,
+    @Param('sectionId') sectionId: string,
+    @Param('lectureId') lectureId: string,
+    @Body('title') title: string,         // ← single field from multipart body
+    @UploadedFile() file: Express.Multer.File,
+    @Request() req: any,
+) {
+    if (!file) throw new BadRequestException('File is required');
+    if (!title?.trim()) throw new BadRequestException('Title is required');
+    return this.service.addFile(courseId, sectionId, lectureId, file, title.trim(), req.user.userId);
+}
+```
+
+`allowedExtensions` is a constant defined at the top of the controller: `.pdf`, `.zip`, `.ppt`, `.pptx`, `.doc`, `.docx`, `.xls`, `.xlsx`. The `fileFilter` callback rejects all other types before Multer writes them to disk — the bad file never touches the filesystem.
+
+`limits: { fileSize: 50 * 1024 * 1024 }` caps uploads at 50 MB. Multer rejects over-limit files with a `LIMIT_FILE_SIZE` error before the controller handler runs.
+
+#### Module — `lecture-resources.module.ts`
+
+```typescript
+@Module({
+    imports: [TypeOrmModule.forFeature([LectureResource, Lecture, Section])],
+    controllers: [LectureResourcesController],
+    providers: [LectureResourcesService],
+})
+export class LectureResourcesModule {}
+```
+
+Three entities are registered: `LectureResource` (the new entity), `Lecture` (needed to verify the lecture belongs to the section), and `Section` (needed for ownership verification). All three repositories are injected into `LectureResourcesService`.
+
+`LectureResourcesModule` is imported into `AppModule` alongside the other domain modules.
+
+#### `main.ts` — static file serving and directory bootstrap
+
+```typescript
+const app = await NestFactory.create<NestExpressApplication>(AppModule);
+// …
+const uploadsDir = join(process.cwd(), 'uploads', 'resources');
+if (!existsSync(uploadsDir)) mkdirSync(uploadsDir, { recursive: true });
+app.useStaticAssets(join(process.cwd(), 'uploads'), { prefix: '/uploads' });
+```
+
+`NestFactory.create` is now typed as `NestExpressApplication` (not the base `INestApplication`) so that `useStaticAssets()` is available — it is an Express-specific method. `mkdirSync({ recursive: true })` ensures the directory exists on first boot without failing if it already exists.
+
+---
+
+### 4.5 Frontend — Resources Page
+
+**Route:** `/courses/[id]/sections/[sectionId]/lectures/[lectureId]/resources`
+**File:** `frontend/src/app/courses/[id]/sections/[sectionId]/lectures/[lectureId]/resources/page.tsx`
+
+The page is reached from a **Resources** button added to each lecture row on the lectures management page:
+
+```tsx
+<Button size="sm" variant="outline" asChild>
+    <Link href={`/courses/${courseId}/sections/${sectionId}/lectures/${lecture.lecture_id}/resources`}>
+        Resources
+    </Link>
+</Button>
+```
+
+#### Data fetching
+
+```typescript
+const { data: resources } = useQuery<LectureResource[]>({
+    queryKey: ['resources', courseId, sectionId, lectureId],
+    queryFn: async () => {
+        const { data } = await api.get(resourcesBase);
+        return data;
+    },
+    enabled: !!accessToken && !!courseId && !!sectionId && !!lectureId,
+});
+```
+
+The `queryKey` scopes the cache to the specific lecture — four levels deep. Each mutation calls `invalidateQueries` on the same key to keep the list in sync.
+
+#### Two-tab UX
+
+A pair of buttons acts as a simple tab switcher:
+
+```tsx
+const [activeTab, setActiveTab] = useState<'link' | 'file'>('link');
+
+<Button variant={activeTab === 'link' ? 'default' : 'outline'} onClick={() => setActiveTab('link')}>
+    Add Link
+</Button>
+<Button variant={activeTab === 'file' ? 'default' : 'outline'} onClick={() => setActiveTab('file')}>
+    Upload File
+</Button>
+```
+
+The `default` variant highlights the active tab; `outline` shows the inactive one. Clicking switches `activeTab` state, which conditionally renders one form or the other. This is pure local UI state — no Zustand needed.
+
+#### Add link mutation
+
+```typescript
+const addLinkMutation = useMutation({
+    mutationFn: (data: LinkForm) => api.post(`${resourcesBase}/link`, data),
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['resources', courseId, sectionId, lectureId] });
+        resetLink();
+    },
+});
+```
+
+Standard JSON POST. The Zod schema mirrors the backend DTO: title required, url must be a valid URL with protocol.
+
+#### File upload mutation
+
+```typescript
+const addFileMutation = useMutation({
+    mutationFn: async ({ title, file }: { title: string; file: File }) => {
+        const formData = new FormData();
+        formData.append('title', title);
+        formData.append('file', file);
+        return api.post(`${resourcesBase}/file`, formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+        });
+    },
+    onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ['resources', courseId, sectionId, lectureId] });
+        resetFile();
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    },
+});
+```
+
+`FormData` is the browser API for building multipart bodies. The Axios `Content-Type` override is required — without it Axios sends the request as `application/json` and Multer cannot parse the file. After a successful upload, `fileInputRef.current.value = ''` clears the `<input type="file">` so the user can select a new file. React does not manage file input state, so the ref is necessary.
+
+#### Rendering resources
+
+```tsx
+{resources?.map((resource) => (
+    <div key={resource.resource_id} className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground uppercase w-8">
+            {resource.resource_type}       {/* 'file' or 'link' */}
+        </span>
+        <a
+            href={resourceHref(resource)}  {/* see helper below */}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline text-sm flex-1"
+        >
+            {resource.title}
+        </a>
+        {resource.original_filename && (
+            <span className="text-xs text-muted-foreground">
+                ({resource.original_filename})
+            </span>
+        )}
+        <Button size="sm" variant="destructive" onClick={…}>Delete</Button>
+    </div>
+))}
+```
+
+The `resourceHref` helper constructs the download URL based on resource type:
+
+```typescript
+const BACKEND_ORIGIN = 'http://localhost:3002';
+
+function resourceHref(resource: LectureResource) {
+    if (resource.resource_type === 'link') return resource.url;       // already a full URL
+    return `${BACKEND_ORIGIN}${resource.url}`;  // prefix the static server origin
+}
+```
+
+File resources store a relative path (`/uploads/resources/file.zip`). The frontend must prepend the backend origin to form a full download URL. `BACKEND_ORIGIN` is a module-level constant set to `http://localhost:3002` — the port the backend runs on in development (matching the `baseURL` in `src/lib/axios.ts`).
+
+---
+
+### 4.6 Unit Tests — `lecture-resources.service.spec.ts`
+
+The test file covers all four service methods across 16 test cases:
+
+| Method | Cases tested |
+|---|---|
+| `addLink` | Success; section not found; wrong instructor; course PENDING; lecture not found |
+| `addFile` | Success (resource type=FILE, url includes filename); lecture not found; wrong instructor |
+| `findByLecture` | Success (ordered ASC); section not found; wrong instructor |
+| `remove` | Success (link, no filesystem call); success (file, unlink silenced); resource not found; wrong instructor; lecture not found |
+
+**Mock file object:**
+
+```typescript
+const fakeFile = (): Express.Multer.File => ({
+    fieldname: 'file',
+    originalname: 'exercises.zip',
+    encoding: '7bit',
+    mimetype: 'application/zip',
+    size: 1024,
+    filename: '1234567890-abc.zip',          // ← Multer-generated name
+    path: '/uploads/resources/1234567890-abc.zip',
+    destination: '/uploads/resources',
+    buffer: Buffer.from(''),
+    stream: null as any,
+});
+```
+
+The `Express.Multer.File` type is provided by `@types/multer` (installed as a dev dependency). Tests verify that the service stores `/uploads/resources/${file.filename}` as the URL and `file.originalname` as `original_filename` — not the other way around.
+
+The `remove` test for file resources verifies that `resourceRepo.remove` is called even when `unlinkSync` would error (the file path doesn't exist in the test environment). The service silences the `unlinkSync` error with a try/catch, so the test passes without filesystem setup.
+
+---
+
+### 4.7 Security / Design Notes
+
+**Ownership is verified at two levels.** Every service method calls `verifyLectureOwnership`, which checks both:
+1. That the authenticated user is the instructor of the course (via the section → course → instructor chain)
+2. That the target lecture belongs to the given section (a `lecture_id` from a different section cannot be used)
+
+This prevents an instructor from attaching resources to another instructor's lecture by guessing UUIDs.
+
+**Pending course lockout.** Resources cannot be added or removed while the course is in `PENDING` status — `verifyLectureOwnership` enforces the same pending-course check as all other lecture mutation services.
+
+**File type allowlist.** The `fileFilter` in Multer rejects files whose extension is not in the allowlist (`.pdf`, `.zip`, `.ppt`, `.pptx`, `.doc`, `.docx`, `.xls`, `.xlsx`) *before writing them to disk*. This is enforced at the controller level, not just the service level.
+
+**Extension validation only (Sprint 4 scope).** MIME type validation (checking the file's actual content, not just its name) is stronger but requires an additional library (`file-type`). For the functional-first development phase, extension allowlisting is sufficient.
+
+**50 MB size cap.** Multer's `limits.fileSize` prevents runaway uploads from exhausting disk space. The limit is configurable — it is currently set to 50 MB as a reasonable default for PDFs and slide decks.
+
+**Static files are public in development.** Any process that knows the generated filename can download the file without authentication. In production, this storage would be replaced by private S3/R2 + pre-signed URLs. This is a known deferred gap documented in `CLAUDE.md`.
+
+---
+
+### 4.8 The Full Flow
+
+**Instructor uploads a file resource:**
+
+```
+Browser                  NestJS (LectureResourcesController)         Disk / PostgreSQL
+  |                                      |                                  |
+  |-- POST …/resources/file              |                                  |
+  |   multipart/form-data                |                                  |
+  |   title: "Exercise files"            |                                  |
+  |   file: exercises.zip (binary)       |                                  |
+  |                              JwtAuthGuard validates token               |
+  |                                      |                                  |
+  |                              FileInterceptor (Multer)                   |
+  |                                      |-- write file to disk ----------->|
+  |                                      |   uploads/resources/1698..zip    |
+  |                              fileFilter: extension check                |
+  |                              limits: size check                         |
+  |                                      |                                  |
+  |                              verifyLectureOwnership()                   |
+  |                                      |-- SELECT section + course ------>|
+  |                                      |<-- { section, course, instr} ----|
+  |                              check instructor + not PENDING             |
+  |                                      |-- SELECT lecture WHERE id ------->|
+  |                                      |<-- { lecture_id, … } ------------|
+  |                                      |                                  |
+  |                              save resource record                       |
+  |                                      |-- INSERT lecture_resources ------>|
+  |                                      |   url=/uploads/resources/…       |
+  |                                      |   original_filename=exercises.zip |
+  |                                      |<-- { resource_id, … } -----------|
+  |<-- 201 { resource_id, title, resource_type: 'file', url, original_filename }
+```
+
+**Instructor adds an external link:**
+
+```
+Browser                  NestJS (LectureResourcesController)          PostgreSQL
+  |                                      |                                  |
+  |-- POST …/resources/link              |                                  |
+  |   { title: "Docs", url: "https://…" }|                                  |
+  |                              ValidationPipe validates AddLinkDto        |
+  |                              verifyLectureOwnership()                   |
+  |                                      |-- (ownership queries) ----------->|
+  |                                      |                                  |
+  |                                      |-- INSERT lecture_resources ------>|
+  |                                      |   resource_type='link'            |
+  |                                      |   url='https://…'                |
+  |                                      |   original_filename=NULL          |
+  |<-- 201 { resource_id, title, resource_type: 'link', url }            |
+```
+
+**Student views and downloads a resource:**
+
+```
+Browser                   NestJS (Express static middleware)         Disk
+  |                                      |                              |
+  |-- GET /uploads/resources/1698..zip ->|                              |
+  |                            (no controller, no guard)                |
+  |                            Express static() serves file            |
+  |                                      |-- read file from disk ------>|
+  |                                      |<-- file bytes ---------------|
+  |<-- 200 <binary content> ----------------------------|
 ```

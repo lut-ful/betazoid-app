@@ -1,3 +1,4 @@
+import { LectureResourcesModule } from './lecture-resources/lecture-resources.module';
 import { MailModule } from './mail/mail.module';
 import { AuthModule } from './auth/auth.module';
 import { CategoriesModule } from './categories/categories.module';
@@ -40,6 +41,7 @@ import { PermissionsGuard } from './auth/guards/permissions.guard';
     PermissionsModule,
     RolesModule,
     LecturesModule,
+    LectureResourcesModule,
     SectionsModule,
     UsersModule,
   ],
